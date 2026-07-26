@@ -1699,6 +1699,8 @@ typedef struct {
     Model *m; ESlot *s; int layer,eid,fatal;
     st_tensor *tw[3],*tq[3]; int64_t pos[3];
     int pending,done,finalized,error;
+    int rep;                       /* O1a: dual-SSD replica serving this load (0=primary) */
+    int64_t io_bytes;              /* O1b: total bytes requested, counted at finalize */
 } UringLoad;
 typedef struct {
     ColiUring ring;
@@ -1755,6 +1757,15 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
     int64_t wtot=l->tw[0]->nbytes+l->tw[1]->nbytes+l->tw[2]->nbytes;
     int64_t ftot=(l->tq[0]->nbytes+l->tq[1]->nbytes+l->tq[2]->nbytes)/4;
     if(wtot<=0 || ftot<=0) return uring_load_error(l,EINVAL,"io_uring expert size"),li;
+    /* O1a: DUAL-SSD routing — same replica choice + partial-mirror fallback as
+     * expert_load_impl (the pread path). Without this, URING=1 sent 100% of
+     * expert bytes to the primary drive, forfeiting the mirror's bandwidth.
+     * Offsets are identical on both drives by mirror construction (st_mirror_init
+     * accepts byte-identical headers only), so only the fd changes. */
+    int rep=expert_route(layer,eid);
+    if(rep && st_fd_rep(&m->S,l->tw[0]->fd,1)<0) rep=0;   /* shard not in the mirror (partial) */
+    l->rep=rep;
+    l->io_bytes=wtot+(l->tq[0]->nbytes+l->tq[1]->nbytes+l->tq[2]->nbytes);
     if(!s->slab || wtot+8192>s->slab_cap){
 #ifdef COLI_METAL
         if(s->slab&&g_metal_enabled) coli_metal_unregister(s->slab);
@@ -1790,7 +1801,7 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
         && l->tw[ord[1]]->off+l->tw[ord[1]]->nbytes==l->tw[ord[2]]->off;
     if(contig){
         int64_t off0=l->tw[ord[0]]->off;
-        int dfd=g_direct?st_direct_fd(&m->S,l->tw[ord[0]]->fd):-1;
+        int dfd=g_direct?st_direct_fd_rep(&m->S,l->tw[ord[0]]->fd,rep):-1;
         if(dfd>=0){
             int64_t base=off0&~4095LL,need=(off0-base)+wtot,len=(need+4095)&~4095LL;
             l->pos[ord[0]]=off0-base; l->pos[ord[1]]=l->pos[ord[0]]+l->tw[ord[0]]->nbytes;
@@ -1800,20 +1811,20 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
         }else{
             l->pos[ord[0]]=0; l->pos[ord[1]]=l->tw[ord[0]]->nbytes;
             l->pos[ord[2]]=l->pos[ord[1]]+l->tw[ord[1]]->nbytes;
-            if(uring_add_read(b,li,l->tw[ord[0]]->fd,s->slab,(size_t)wtot,off0,(size_t)wtot))
+            if(uring_add_read(b,li,rep_bfd(&m->S,l->tw[ord[0]]->fd,rep),s->slab,(size_t)wtot,off0,(size_t)wtot))
                 return uring_load_error(l,errno,"io_uring expert read"),li;
         }
     }else{
         int64_t o=0;
         for(int a=0;a<3;a++){ int k=ord[a]; l->pos[k]=o;
-            if(uring_add_read(b,li,l->tw[k]->fd,s->slab+o,(size_t)l->tw[k]->nbytes,l->tw[k]->off,(size_t)l->tw[k]->nbytes))
+            if(uring_add_read(b,li,rep_bfd(&m->S,l->tw[k]->fd,rep),s->slab+o,(size_t)l->tw[k]->nbytes,l->tw[k]->off,(size_t)l->tw[k]->nbytes))
                 return uring_load_error(l,errno,"io_uring expert read"),li;
             o+=l->tw[k]->nbytes;
         }
     }
     int64_t fo=0;
     for(int k=0;k<3;k++){
-        if(uring_add_read(b,li,l->tq[k]->fd,s->fslab+fo,(size_t)l->tq[k]->nbytes,l->tq[k]->off,(size_t)l->tq[k]->nbytes))
+        if(uring_add_read(b,li,rep_bfd(&m->S,l->tq[k]->fd,rep),s->fslab+fo,(size_t)l->tq[k]->nbytes,l->tq[k]->off,(size_t)l->tq[k]->nbytes))
             return uring_load_error(l,errno,"io_uring expert scale read"),li;
         fo+=l->tq[k]->nbytes/4;
     }
@@ -1848,9 +1859,19 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
     if(g_drop){
         int ord0=0; for(int k=1;k<3;k++) if(l->tw[k]->off<l->tw[ord0]->off) ord0=k;
         int64_t wtot=l->tw[0]->nbytes+l->tw[1]->nbytes+l->tw[2]->nbytes;
-        posix_fadvise(l->tw[ord0]->fd,l->tw[ord0]->off,wtot,POSIX_FADV_DONTNEED);
-        for(int k=0;k<3;k++) posix_fadvise(l->tq[k]->fd,l->tq[k]->off,l->tq[k]->nbytes,POSIX_FADV_DONTNEED);
+        /* O1a: drop the pages of the replica that actually served the read */
+        posix_fadvise(rep_bfd(&l->m->S,l->tw[ord0]->fd,l->rep),l->tw[ord0]->off,wtot,POSIX_FADV_DONTNEED);
+        for(int k=0;k<3;k++) posix_fadvise(rep_bfd(&l->m->S,l->tq[k]->fd,l->rep),l->tq[k]->off,l->tq[k]->nbytes,POSIX_FADV_DONTNEED);
     }
+    /* O1b: I/O accounting parity with the pread path (expert_load_impl counts at
+     * the read; here the load completes at finalize). PROF=1's disk-bytes and the
+     * per-run MIRROR: line were silently ~0 under URING=1, corrupting the exact
+     * numbers used to tune this subsystem. Thread-second service time (g_edisk_ns)
+     * has no per-read equivalent in the kernel-owned uring model and stays
+     * intentionally unreported here. */
+    atomic_fetch_add_explicit(&g_prof_io,l->io_bytes,memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_mir_bytes[l->rep],l->io_bytes,memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_mir_nread[l->rep],1,memory_order_relaxed);
     Cfg *c=&l->m->c; int I=c->moe_inter,D=c->hidden; float *fp[3]; int64_t fo=0;
     QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D},II[3]={D,D,I};
     for(int k=0;k<3;k++){
