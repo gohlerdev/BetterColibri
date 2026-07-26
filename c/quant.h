@@ -1189,9 +1189,65 @@ static void matmul_e8(float *y, const float *x, const uint8_t *q, const float *u
                       int S, int I, int O){
     (void)unused;                                  /* scales live inside the blocks */
     int64_t nb=e8_blocks(I), rb=e8_rowbytes(I);
+    /* S>1 (prefill / MTP verify): the lattice decode (grid lookups, parity,
+     * sign math in e8_expand_sub) depends only on the WEIGHT row, yet the old
+     * loop re-ran it for every activation row — at S=512 each super-block was
+     * decoded 512 times. Expand the row once per thread into scratch, then dot
+     * per activation row. The per-sub partial `a` accumulation into `acc` is
+     * kept EXACTLY as before (same order, same operations), so the output is
+     * bit-identical; only where w[] comes from changes. S==1 keeps the inline
+     * path: no reuse to win, and it avoids the scratch traffic. */
+    float *e8_scratch = S>1 ? (float*)malloc((size_t)
+#ifdef _OPENMP
+        omp_get_max_threads()
+#else
+        1
+#endif
+        *(size_t)I*sizeof(float)) : NULL;
+    if(S>1 && !e8_scratch){ fprintf(stderr,"OOM matmul_e8 scratch\n"); exit(1); }
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){
         const uint8_t *wrow=q+(int64_t)o*rb;
+        if(e8_scratch){
+            float *wr=e8_scratch+(int64_t)
+#ifdef _OPENMP
+                omp_get_thread_num()
+#else
+                0
+#endif
+                *I;
+            for(int64_t b=0;b<nb;b++){             /* decode the row ONCE */
+                const uint8_t *blk=wrow+b*E8_BBYTES;
+                uint16_t dh; memcpy(&dh, blk+96, 2);
+                float d=e8_fp16_to_f32(dh);
+                int base=(int)(b*E8_QK);
+                for(int ib=0; ib<E8_QK/E8_SUB; ib++){
+                    int off=base+ib*E8_SUB;
+                    if(off>=I) break;
+                    float w[E8_SUB];
+                    e8_expand_sub(blk, ib, d, w);
+                    int n = I-off < E8_SUB ? I-off : E8_SUB;
+                    for(int k=0;k<n;k++) wr[off+k]=w[k];
+                }
+            }
+            for(int s=0;s<S;s++){
+                const float *xs=x+(int64_t)s*I;
+                float acc=0;
+                for(int64_t b=0;b<nb;b++){         /* same per-sub partial order */
+                    int base=(int)(b*E8_QK);
+                    for(int ib=0; ib<E8_QK/E8_SUB; ib++){
+                        int off=base+ib*E8_SUB;
+                        if(off>=I) break;
+                        int n = I-off < E8_SUB ? I-off : E8_SUB;
+                        float a=0;
+                        for(int k=0;k<n;k++) a += xs[off+k]*wr[off+k];
+                        acc+=a;
+                    }
+                }
+                y[(int64_t)s*O+o]=acc;
+            }
+            continue;
+        }
         for(int s=0;s<S;s++){
             const float *xs=x+(int64_t)s*I;
             float acc=0;
@@ -1214,6 +1270,7 @@ static void matmul_e8(float *y, const float *x, const uint8_t *q, const float *u
             y[(int64_t)s*O+o]=acc;
         }
     }
+    free(e8_scratch);
 }
 
 #endif /* COLI_QUANT_H */
