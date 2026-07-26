@@ -96,3 +96,22 @@ or explicitly gated.
 10. `docs: align serve_protocol.md with the code; optional _g DLL symbol` (Phase 6)
 
 Each engine commit passes `make -C c portable && make -C c test` before it lands.
+
+---
+
+## Status (2026-07-26, end of session)
+
+| Phase | Commits | Result |
+|-------|---------|--------|
+| 1 — fmt=6 fences + B4 mmap ranges | 23630f3 | done, full test suite green |
+| 2 — io_uring mirror + accounting | 66edccd | done, test_uring + test-c green |
+| 3 — CUDA gates (H1/H2/H5/H8) | 8d4ef07 | done by review; CI syntax jobs validate |
+| 4 — gateway robustness (P1/P2/I3/I4/I5) | 33279e7 | done, 53 server tests + 2 new tests |
+| 5 — perf (P#1 lm_head, P#3 DSA scratch, P#2 E8 hoist) | 3ec7e9e, e9a0161, 6b8c72a | done, bit-identity proven (E8: 168/168 memcmp) |
+| 6 — docs truth + optional _g symbol | 05ac5d7 | done |
+
+Final gate: clean rebuild (`make clean && make portable`) + `make test`
+= 143 Python tests OK (21 skipped), all C tests pass.
+
+Deferred items remain as listed above — they need GPU hardware, model
+weights, or measured A/Bs.
