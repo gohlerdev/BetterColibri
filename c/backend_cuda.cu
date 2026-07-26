@@ -92,7 +92,6 @@ __host__ __device__ static size_t row_bytes(int fmt, int I) {
     if (fmt == 1) return (size_t)I;
     if (fmt == 2 || fmt == 4) return (size_t)(I + 1) / 2;   /* fmt=4: same packed int4 */
     if (fmt == 3) return (size_t)(I + 3) / 4;
-    if (fmt == 4) return (size_t)(I + 1) / 2;   /* grouped int4: nibbles like fmt 2 */
     return 0;
 }
 
@@ -821,6 +820,13 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
     if(profile) cudaEventRecord(ev[1],ctx->stream);
     GroupDesc *dev=(GroupDesc*)ctx->group_desc;
     int tc=getenv("COLI_CUDA_TC_INT4")&&atoi(getenv("COLI_CUDA_TC_INT4"));
+    /* H1: gate on WMMA availability like the W4A16 branch below. grouped_s4_wmma's
+     * body compiles away below __CUDA_ARCH__ 750 and always under HIP — without
+     * this gate, enabling the env var on gfx GPUs or sm<7.5 launched EMPTY kernels
+     * and the D2H returned stale scratch as expert outputs (silent wrong answers,
+     * the exact failure mode backend_gpu_compat.h:9-14 warns about). sm_70 has
+     * fp16 WMMA but not the int4 experimental API — require >= 7.5. */
+    tc=tc&&COLI_GPU_HAS_WMMA&&(ctx->compute_major>7||(ctx->compute_major==7&&ctx->compute_minor>=5));
     tc=tc&&all_s4&&D%32==0&&I%32==0&&D%8==0&&I%8==0;
     int tc_min=getenv("COLI_CUDA_TC_MIN_ROWS")?atoi(getenv("COLI_CUDA_TC_MIN_ROWS")):8;
     for(int c=0;c<count&&tc;c++)tc=rows[c]>=tc_min;
@@ -986,9 +992,15 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
 extern "C" const float *coli_cuda_expert_group_take(int device) {
     DeviceContext *ctx=find_ctx(device);
     if(!ctx||!ctx->group_pending) return nullptr;
-    ctx->group_pending=0;
+    /* H5: clear the pending flag only after a SUCCESSFUL sync. On failure the
+     * queued work may still be executing; clearing early would let the next
+     * issue() reuse host_x/host_y and the stream — and a growth realloc in
+     * reserve() could free buffers the wedged stream still references. Leaving
+     * the flag set makes the next issue() refuse the device (returns 0), which
+     * its callers already treat as a per-device CPU fallback. */
     if(!select_ctx(ctx)) return nullptr;
     if(!cuda_ok(cudaStreamSynchronize(ctx->stream),"expert group take")) return nullptr;
+    ctx->group_pending=0;
     return ctx->host_y;
 }
 
@@ -1068,6 +1080,12 @@ extern "C" int coli_cuda_attention_project_ragged(ColiCudaTensor *w,ColiCudaTens
     if(!w||!proj||!out||!q||!keys||!latent||!rope||!lengths||S<1||S>512||T<1||T>8192||
        H<1||Q<1||R<1||V<1||K<1||K>512||w->I!=K||w->O!=H*(Q+V)||
        proj->device!=w->device||proj->I!=H*V)return 0;
+    /* H2: the ragged kernel reads wscale[row] with per-row (fmt<=2) semantics and
+     * has no gs/ng plumbing — a grouped-int4 (fmt=4) kv_b would compute with wrong
+     * scales, the exact #298 bug the batch/single kernels were fixed for. Refuse
+     * here so the caller takes the correct CPU absorb path; threading absorb_scale
+     * through this kernel is follow-up work that needs GPU validation. */
+    if(w->fmt==4||proj->fmt==4)return 0;
     DeviceContext *dc=find_ctx(w->device);
     if(!select_ctx(dc))return 0;
     float **dl=(float**)std::malloc((size_t)S*sizeof(*dl));
