@@ -776,6 +776,7 @@ class Engine:
         self.hits_seq = 0                      # latest "TIERS" snapshot from the engine
         self.profile = collections.deque(maxlen=PROFILE_TURNS)  # per-turn phase timings
         self.profile_seq = 0
+        self.unknown_lines = 0                 # (P1) unrecognized stdout lines skipped
         read_engine_turn(self.process.stdout, READY, lambda _: None)
         self.dispatcher = threading.Thread(target=self._dispatch_stdout,
                                            name="colibri-stdout", daemon=True)
@@ -879,7 +880,17 @@ class Engine:
                     if events is not None:
                         events.put(("error", _engine_error(fields[2:], message)))
                 else:
-                    raise RuntimeError(f"invalid engine response: {' '.join(fields)}")
+                    # (P1) Forward compatibility: serve_protocol.md's rule is that servers
+                    # MUST ignore line kinds they do not recognize -- new telemetry (PERF/
+                    # ENTROPY/GPUS/TOPK/...) must not brick the gateway. Previously this
+                    # raised, permanently killing every in-flight and future request over
+                    # one stray stdout line. DATA framing above stays strict (size bounds,
+                    # exact reads, terminator check); only unknown HEADER lines are skipped.
+                    self.unknown_lines += 1
+                    if self.unknown_lines <= 20:
+                        sys.stderr.write(f"[api] ignoring unknown engine line: {' '.join(fields)[:200]}\n")
+                    elif self.unknown_lines == 21:
+                        sys.stderr.write("[api] further unknown engine lines suppressed\n")
         except Exception as error:
             if not self.closed:
                 self.dispatcher_error = error
@@ -929,7 +940,23 @@ class Engine:
 
         cancel_sent = False
         while True:
-            kind, value = events.get()
+            # (I3) Poll the cancel callback while WAITING, not only per DATA event:
+            # during a cold prefill (minutes) the engine emits no DATA frames, so a
+            # vanished client used to hold its scheduler slot until the first token.
+            # The engine handles an early CANCEL fine (it checks pending input
+            # between forwards and persists the slot's KV before acknowledging).
+            try:
+                kind, value = events.get(timeout=1.0)
+            except queue.Empty:
+                if not cancel_sent and cancelled and cancelled():
+                    cancel_sent = True
+                    try:
+                        with self.write_lock:
+                            self.process.stdin.write(f"CANCEL {request_id}\n".encode())
+                            self.process.stdin.flush()
+                    except OSError:
+                        pass
+                continue
             if kind == "data":
                 if not cancel_sent:
                     decode(value)
@@ -1122,7 +1149,17 @@ class APIHandler(BaseHTTPRequestHandler):
                 # Liveness is always public; hardware/scheduler internals only when a
                 # request is authed (or no key set), so a configured key isn't leaked
                 # past a bare 200 to an unauthenticated probe. (#SEC-8)
-                payload = {"status": "ok"}
+                # (P2) An orchestrator polling /health must see engine death: report
+                # "degraded" when the dispatcher recorded a fatal error or the engine
+                # process exited. Previously the literal "ok" survived an OOM-killed
+                # engine while every generation request failed with 500s.
+                eng = self.server.engine
+                degraded = bool(eng and (getattr(eng, "dispatcher_error", None) is not None
+                                         or (getattr(eng, "process", None) is not None
+                                             and eng.process.poll() is not None)))
+                payload = {"status": "degraded" if degraded else "ok"}
+                if degraded:
+                    payload["detail"] = "engine unavailable"
                 if self._is_authed():
                     payload["scheduler"] = self.server.scheduler.snapshot()
                     payload["kv_slots"] = self.server.kv_slots
@@ -1142,9 +1179,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_json(200, payload, request_id)
                 return
             if path == "/profile":
+                # (I5 / #SEC-8) same auth gate as /health internals and /experts:
+                # per-turn token counts and phase timings are usage telemetry.
                 eng = self.server.engine
-                payload = {"seq": getattr(eng, "profile_seq", 0) if eng else 0,
-                           "turns": list(getattr(eng, "profile", ()) or ()) if eng else []}
+                payload = {"seq": 0, "turns": []}
+                if self._is_authed() and eng:
+                    payload = {"seq": getattr(eng, "profile_seq", 0),
+                               "turns": list(getattr(eng, "profile", ()) or ())}
                 self.send_json(200, payload, request_id)
                 return
             if self.serve_static(path):
@@ -1330,54 +1371,77 @@ class APIHandler(BaseHTTPRequestHandler):
 
             ka_thread = threading.Thread(target=_keepalive, daemon=True)
             ka_thread.start()
-            if chat and tools:
-                # Suppress tool-call markers from the streamed content and parse the authoritative
-                # calls from the FULL reply after generation. Hold back a marker-length tail so a
-                # <tool_call> split across engine chunks is still caught.
-                sp = {"buf": "", "tool": False}
-                hold = len(BOX_START) - 1
-                raw = []
-                def emit_tools(chunk):
-                    raw.append(chunk)
-                    if dbg_echo:
-                        sys.stderr.write(chunk); sys.stderr.flush()
-                    if sp["tool"]:
-                        return
-                    sp["buf"] += chunk
-                    cut = sp["buf"].find(BOX_START)
-                    if cut >= 0:
-                        if cut:
-                            emit(sp["buf"][:cut])
-                        sp["buf"] = ""
-                        sp["tool"] = True
-                        return
-                    flush = max(0, len(sp["buf"]) - hold)
-                    if flush:
-                        emit(sp["buf"][:flush])
-                        sp["buf"] = sp["buf"][flush:]
-                stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, emit_tools, cache_slot,
-                    lambda: not connected, grammar=grammar)
-                if not sp["tool"] and sp["buf"]:
-                    emit(sp["buf"])                     # no tool call happened: flush held tail
-                _content, calls = parse_tool_calls("".join(raw), tools)
-                for i, tc in enumerate(calls):
-                    event([{"index": 0, "delta": {"tool_calls": [{"index": i, "id": tc["id"],
-                             "type": "function", "function": {"name": tc["function"]["name"],
-                             "arguments": tc["function"]["arguments"]}}]},
-                            "logprobs": None, "finish_reason": None}])
-                finish = "tool_calls" if calls else ("length" if stats["length_limited"] else "stop")
-            else:
-                def emit_plain(chunk):
-                    if dbg_echo:
-                        sys.stderr.write(chunk); sys.stderr.flush()
-                    emit(chunk)
-                stats = self.server.engine.generate(
-                    prompt, maximum, temperature, top_p, emit_plain, cache_slot,
-                    lambda: not connected, grammar=grammar)
-                finish = "length" if stats["length_limited"] else "stop"
-            ka_stop.set()                          # generation done: stop the keepalive pump
-            ka_thread.join(timeout=2)
+            # (I4) The keepalive pump must stop on EVERY exit — including an engine
+            # error raised out of generate(). Previously an exception skipped ka_stop
+            # forever (leaked pinging thread) and do_POST wrote an HTTP-500 JSON body
+            # into the already-started SSE stream (invalid HTTP). Wrap the streaming
+            # section; on error emit a proper SSE error frame and close.
+            try:
+                if chat and tools:
+                    # Suppress tool-call markers from the streamed content and parse the authoritative
+                    # calls from the FULL reply after generation. Hold back a marker-length tail so a
+                    # <tool_call> split across engine chunks is still caught.
+                    sp = {"buf": "", "tool": False}
+                    hold = len(BOX_START) - 1
+                    raw = []
+                    def emit_tools(chunk):
+                        raw.append(chunk)
+                        if dbg_echo:
+                            sys.stderr.write(chunk); sys.stderr.flush()
+                        if sp["tool"]:
+                            return
+                        sp["buf"] += chunk
+                        cut = sp["buf"].find(BOX_START)
+                        if cut >= 0:
+                            if cut:
+                                emit(sp["buf"][:cut])
+                            sp["buf"] = ""
+                            sp["tool"] = True
+                            return
+                        flush = max(0, len(sp["buf"]) - hold)
+                        if flush:
+                            emit(sp["buf"][:flush])
+                            sp["buf"] = sp["buf"][flush:]
+                    stats = self.server.engine.generate(
+                        prompt, maximum, temperature, top_p, emit_tools, cache_slot,
+                        lambda: not connected, grammar=grammar)
+                    if not sp["tool"] and sp["buf"]:
+                        emit(sp["buf"])                     # no tool call happened: flush held tail
+                    _content, calls = parse_tool_calls("".join(raw), tools)
+                    for i, tc in enumerate(calls):
+                        event([{"index": 0, "delta": {"tool_calls": [{"index": i, "id": tc["id"],
+                                 "type": "function", "function": {"name": tc["function"]["name"],
+                                 "arguments": tc["function"]["arguments"]}}]},
+                                "logprobs": None, "finish_reason": None}])
+                    finish = "tool_calls" if calls else ("length" if stats["length_limited"] else "stop")
+                else:
+                    def emit_plain(chunk):
+                        if dbg_echo:
+                            sys.stderr.write(chunk); sys.stderr.flush()
+                        emit(chunk)
+                    stats = self.server.engine.generate(
+                        prompt, maximum, temperature, top_p, emit_plain, cache_slot,
+                        lambda: not connected, grammar=grammar)
+                    finish = "length" if stats["length_limited"] else "stop"
+            except ClientCancelled:
+                raise
+            except Exception as error:                 # noqa: BLE001 - engine/dispatcher failures
+                self.log_error("streaming request failed: %s", error)
+                if connected:
+                    with ka_lock:
+                        try:
+                            err = {"error": {"message": "The colibri engine failed to process the request.",
+                                             "type": "server_error", "param": None, "code": "engine_error"}}
+                            self.wfile.write(("data: " + json.dumps(err, separators=(",", ":")) + "\n\n").encode())
+                            self.wfile.write(b"data: [DONE]\n\n")
+                            self.wfile.flush()
+                        except OSError:
+                            pass
+                self.close_connection = True
+                return
+            finally:
+                ka_stop.set()                          # generation done or failed: stop the pump
+                ka_thread.join(timeout=2)
             final_choice = ({"index": 0, "delta": {}, "logprobs": None, "finish_reason": finish}
                             if chat else {"index": 0, "text": "", "logprobs": None,
                                           "finish_reason": finish})

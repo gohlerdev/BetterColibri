@@ -389,6 +389,50 @@ class DispatcherTest(unittest.TestCase):
             engine.generate("again", 4, 0.7, 0.9, lambda _: None)
         engine.close()
 
+    def test_unknown_engine_lines_are_ignored(self):
+        # (P1) serve_protocol.md forward-compat rule: unknown line kinds must be
+        # skipped, not fatal. PERF/ENTROPY/GPUS are documented telemetry the
+        # dispatcher has no arms for yet; a stray line must not brick the server.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"PERF 1 0.5 0.1 0.1 0.1 0.1 0.1 0.1\n")
+            process.stdout.feed(b"ENTROPY 3.2 4.1\n")
+            process.stdout.feed(b"some-future-line with words\n")
+            process.stdout.feed(b"DATA " + request_id + b" 2\nok\n")
+            process.stdout.feed(b"DONE " + request_id + b" STAT 1 1 0 1 1 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        chunks = []
+        stats = engine.generate("hello", 4, 0.7, 0.9, chunks.append)
+        self.assertEqual(chunks, ["ok"])
+        self.assertEqual(stats["completion_tokens"], 1)
+        self.assertEqual(engine.unknown_lines, 3)
+        self.assertIsNone(engine.dispatcher_error)
+        engine.close()
+
+    def test_cancel_sent_while_waiting_before_first_token(self):
+        # (I3) a client that disconnects during prefill (no DATA yet) must still
+        # trigger a CANCEL from the events.get timeout poll.
+        cancelled_flag = threading.Event()
+
+        def respond(process, frame):
+            fields = frame.split(b"\n", 1)[0].split()
+            if fields[0] == b"SUBMIT":
+                cancelled_flag.set()          # engine "prefilling": emit nothing
+            elif fields[0] == b"CANCEL":
+                process.stdout.feed(b"ERROR " + fields[1] + b" CANCELLED\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaises(ClientCancelled):
+            engine.generate("hello", 8, 0.7, 0.9, lambda _: None,
+                            cancelled=cancelled_flag.is_set)
+        engine.close()
+        self.assertTrue(any(w.startswith(b"CANCEL") for w in process.writes))
+
     def test_decodes_utf8_split_across_data_frames(self):
         def respond(process, frame):
             request_id = frame.split()[1]
@@ -486,9 +530,9 @@ class HTTPTest(unittest.TestCase):
         self.assertIn("queued", scheduler)
         self.assertEqual(health["kv_slots"], 2)
 
-    def test_profile_reports_recent_turns_without_auth(self):
-        with urlopen(self.base + "/profile", timeout=2) as response:
-            self.assertEqual(json.load(response), {"seq": 0, "turns": []})
+    def test_profile_requires_auth_for_turn_data(self):
+        # (#SEC-8) /profile carries per-turn usage telemetry: unauthenticated
+        # probes get an empty payload, authed requests get the turns.
         turn = {"wall_s": 2.5, "prompt_tokens": 7, "completion_tokens": 12,
                 "expert_disk_s": 0.4, "expert_wait_s": 0.1, "expert_matmul_s": 0.9,
                 "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15}
@@ -496,6 +540,8 @@ class HTTPTest(unittest.TestCase):
         self.engine.profile_seq = 1
         try:
             with urlopen(self.base + "/profile", timeout=2) as response:
+                self.assertEqual(json.load(response), {"seq": 0, "turns": []})
+            with self.request("/profile") as response:
                 self.assertEqual(json.load(response), {"seq": 1, "turns": [turn]})
         finally:
             del self.engine.profile, self.engine.profile_seq
