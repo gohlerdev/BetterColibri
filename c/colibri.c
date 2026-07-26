@@ -534,7 +534,7 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     }
 #endif
 #ifdef COLI_CUDA
-    if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && w->fmt!=5 && !omp_in_parallel()){
+    if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && w->fmt!=5 && w->fmt!=6 && !omp_in_parallel()){
         const void *weights = w->fmt==0 ? (const void*)w->qf
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device,w->gs)) return;
@@ -1045,6 +1045,19 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
 }
 static QT qt_load(Model *m, const char *name, int O, int I, int bits){
     QT t; memset(&t,0,sizeof(t)); qt_from_disk(m,name,O,I,bits,0,&t);
+    /* B1/B2 fence: fmt=6 (E8/IQ3 lattice) is an EXPERT-ONLY format. Its weights are
+     * stored under the rotation W@Q and require the FWHT-rotated activations that only
+     * moe() builds (e8_rot_rows at the expert call sites); the generic matmul path and
+     * the per-row decoders (embed_row/qt_addrow/qt_matvec_rows) have no rotation and
+     * would either compute garbage or fall through to the int2 decoder while reading
+     * the 1-float .qs tag out of bounds. A container that packs a RESIDENT tensor
+     * (embed/lm_head/attention/shared-expert/router) as fmt=6 is refused loudly here
+     * — same policy as qt_resolve_fmt for unknown layouts (untrusted container). */
+    if(t.fmt==6){
+        fprintf(stderr,"%s: E8/IQ3 (fmt=6) is supported for streamed experts only — "
+                "a resident tensor in this format cannot be computed faithfully, refusing\n",name);
+        exit(1);
+    }
 #ifdef COLI_CUDA
     if(g_cuda_enabled&&g_cuda_dense){
         t.cuda_eligible=1;
@@ -1285,8 +1298,11 @@ static void embed_row(Model *m, int tok, float *x){
             for(int k=0;k<n;k++){ unsigned u=((lo[k>>2]>>((k&3)*2))&3)|(((hi[k>>3]>>(k&7))&1)<<2);
                 x[base+k]=(float)((int)u-4)*sr[g]; } }
         return; }
-    const uint8_t *q=e->q4+(int64_t)tok*((D+3)/4); float s=e->s[tok];   /* int2 */
-    for(int i=0;i<D;i++){ uint8_t byte=q[i>>2]; int sh=(i&3)*2; x[i]=(float)((int)((byte>>sh)&3)-2)*s; }
+    if(e->fmt==3){ const uint8_t *q=e->q4+(int64_t)tok*((D+3)/4); float s=e->s[tok];   /* int2 */
+        for(int i=0;i<D;i++){ uint8_t byte=q[i>>2]; int sh=(i&3)*2; x[i]=(float)((int)((byte>>sh)&3)-2)*s; }
+        return; }
+    /* B1 fence: unknown fmt (incl. 6/E8) must not decode as int2 — see qt_addrow. */
+    fprintf(stderr,"embed_row: unsupported fmt=%d\n",e->fmt); exit(1);
 }
 
 /* COLI_MMAP=1: gli expert diventano VISTE dentro mmap dei file safetensors (niente pread,
@@ -2093,8 +2109,12 @@ static void qt_addrow(const QT *t, int row, float coef, float *acc){
 #endif
         for(int i=0;i+1<I;i+=2){ uint8_t b=w[i>>1]; acc[i]+=c*((int)(b&0xF)-8); acc[i+1]+=c*((int)(b>>4)-8); }
         if(I&1){ uint8_t b=w[I>>1]; acc[I-1]+=c*((int)(b&0xF)-8); } return; }
-    const uint8_t *w=t->q4+(int64_t)row*((I+3)/4);
-    for(int i=0;i<I;i++){ uint8_t b=w[i>>2]; acc[i]+=c*((int)((b>>((i&3)*2))&3)-2); }
+    if(t->fmt==3){ const uint8_t *w=t->q4+(int64_t)row*((I+3)/4);
+        for(int i=0;i<I;i++){ uint8_t b=w[i>>2]; acc[i]+=c*((int)((b>>((i&3)*2))&3)-2); } return; }
+    /* B1 fence: no silent int2 fall-through for unknown formats. fmt=6 (E8) rows
+     * cannot be decoded here (in-block scales, lattice layout, t->s is a 1-float
+     * tag — s[row] would read OOB); any future fmt must add its own branch. */
+    fprintf(stderr,"qt_addrow: unsupported fmt=%d\n",t->fmt); exit(1);
 }
 /* y[0..n) = W[r0+j,:]·x  (matvec su una FETTA di righe del QT) */
 static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y){
@@ -2117,13 +2137,6 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
 #endif
             for(int i=0;i+1<I;i+=2){ uint8_t b=w[i>>1]; acc+=((int)(b&0xF)-8)*x[i]+((int)(b>>4)-8)*x[i+1]; }
             if(I&1){ uint8_t b=w[I>>1]; acc+=((int)(b&0xF)-8)*x[I-1]; } a=acc*s; }
-        else if(t->fmt==4){ /* per-gruppo, come matmul_i4_grouped / per-group, as matmul_i4_grouped */
-            const uint8_t *w=t->q4+(int64_t)row*((I+1)/2);
-            int gs=t->gs, ng=(I+gs-1)/gs; const float *scl=t->s+(int64_t)row*ng;
-            for(int g=0; g*gs<I; g++){ int base=g*gs, end=base+gs>I?I:base+gs; float acc=0;
-                for(int i=base;i<end;i++){ uint8_t b=w[i>>1];
-                    acc+=(float)((i&1)?((int)(b>>4)-8):((int)(b&0xF)-8))*x[i]; }
-                a+=(double)acc*scl[g]; } }
         else if(t->fmt==5){ const uint8_t *w=t->q4+(int64_t)row*i3_rowbytes(I);
             const float *sr=t->s+(int64_t)row*i3_groups(I); int64_t ng=i3_groups(I);
             for(int64_t g=0; g<ng; g++){ const uint8_t *lo=w+g*I3_GBYTES, *hi=lo+16;
@@ -2131,8 +2144,12 @@ static void qt_matvec_rows(const QT *t, int r0, int n, const float *x, float *y)
                 for(int k=0;k<n;k++){ unsigned u=((lo[k>>2]>>((k&3)*2))&3)|(((hi[k>>3]>>(k&7))&1)<<2);
                     acc+=(float)((int)u-4)*x[base+k]; }
                 a+=(double)(acc*sr[g]); } }
-        else { const uint8_t *w=t->q4+(int64_t)row*((I+3)/4); float s=t->s[row]; float acc=0;
+        else if(t->fmt==3){ const uint8_t *w=t->q4+(int64_t)row*((I+3)/4); float s=t->s[row]; float acc=0;
             for(int i=0;i<I;i++){ uint8_t b=w[i>>2]; acc+=((int)((b>>((i&3)*2))&3)-2)*x[i]; } a=acc*s; }
+        else { /* B1 fence: unknown/unsupported fmt (incl. 6/E8: in-block scales,
+                * 1-float .qs tag — s[row] would read OOB) must fail loudly, never
+                * decode as int2. */
+            fprintf(stderr,"qt_matvec_rows: unsupported fmt=%d\n",t->fmt); exit(1); }
         y[j]=(float)a;
     }
 }
@@ -5747,10 +5764,23 @@ static int mem_wire(void *addr, size_t len){
 /* undo qt_wire_mmap for one QT: used when a REPIN gpu_swap promotes a wired
  * RAM-tier expert into VRAM -- without this every promotion leaks its locked
  * host range and the dead-weight lock re-grows over a long session. */
+/* B4: byte size of a QT's scale array, per format — the same arithmetic as
+ * qt_bytes()/st_read_f32_cap. The old flat O*4 was wrong for grouped formats:
+ * fmt=4 keeps O*ceil(I/gs) floats, fmt=5 O*i3_groups(I), fmt=6 a 1-float tag
+ * (scales live in-block). Deriving weight_b as qt_bytes()-O*4 then over-wired
+ * past the weight mapping (locking unrelated file pages, or failing) and
+ * munlock under-released on the REPIN promote path, leaking locked pages. */
+static int64_t qt_scale_bytes(const QT *t){
+    if(t->fmt==4){ int ng=(t->I+t->gs-1)/t->gs; return (int64_t)t->O*ng*4; }
+    if(t->fmt==5) return (int64_t)t->O*i3_groups(t->I)*4;
+    if(t->fmt==6) return 4;
+    if(t->fmt==0) return 0;                      /* f32: no scale array */
+    return (int64_t)t->O*4;                      /* fmt 1/2/3: per-row */
+}
 static void qt_unwire_mmap(QT *t){
     if(!g_mmap || !mem_should_wire()) return;
     if(!t->q8 && !t->q4) return;
-    int64_t scale_b=(int64_t)t->O*4;
+    int64_t scale_b=qt_scale_bytes(t);
     int64_t weight_b=qt_bytes(t)-scale_b;
     void *wp=t->q8?(void*)t->q8:(void*)t->q4;
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
@@ -5764,7 +5794,7 @@ static void qt_unwire_mmap(QT *t){
 static void qt_wire_mmap(QT *t, int64_t *wired, long *failed){
     if(!t->q8 && !t->q4) return;
     if(t->cuda_eligible) return;   /* resident in VRAM; host range is dead weight */
-    int64_t scale_b=(int64_t)t->O*4;
+    int64_t scale_b=qt_scale_bytes(t);
     int64_t weight_b=qt_bytes(t)-scale_b;
     void *wp=t->q8?(void*)t->q8:(void*)t->q4;
     if(weight_b>0){ if(mem_wire(wp,(size_t)weight_b)==0) *wired+=weight_b; else (*failed)++; }
