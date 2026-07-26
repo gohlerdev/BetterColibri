@@ -2486,6 +2486,16 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 m->dsa_sel=malloc((size_t)m->dsa_scap*sizeof(int));
                 m->dsa_nsel=malloc((size_t)S*sizeof(int));
             }
+            /* Per-thread scratch hoisted OUT of the parallel loop (P#3): the old
+             * per-position falloc/free of qi/w32/isc/tmp — four allocator round
+             * trips per position inside the OMP region — serialized prefill on
+             * the allocator lock. One block per thread, sized for the worst nk
+             * of this batch; the math and its order are untouched. */
+            int64_t nk_cap=1;
+            for(int s=0;s<S;s++){ int pos=positions?positions[s]:pos_base+s;
+                if((int64_t)pos+1>nk_cap) nk_cap=pos+1; }
+            int64_t per_thread=(int64_t)nh*hd + nh + 2*nk_cap;
+            float *dsa_scratch=falloc((int64_t)omp_get_max_threads()*per_thread);
             #pragma omp parallel for schedule(dynamic,1)
             for(int s=0;s<S;s++){
                 KVState *ks=kvs?kvs[s]:m->kv;
@@ -2493,13 +2503,12 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 if(ks->kv_start[layer]!=0){ m->dsa_nsel[s]=0; continue; }
                 if(nk<=dtopk && !g_dsa_force){ m->dsa_nsel[s]=0; continue; }
                 int keep = nk<dtopk ? nk : dtopk;
-                float *qi=falloc((int64_t)nh*hd);
+                float *base=dsa_scratch+(int64_t)omp_get_thread_num()*per_thread;
+                float *qi=base, *w32=qi+(int64_t)nh*hd, *isc=w32+nh, *tmp=isc+nk_cap;
                 matmul_qt(qi, QR+(int64_t)s*c->q_lora, &m->ix_wq[layer], 1);
                 for(int h=0;h<nh;h++) rope_interleave(qi+(int64_t)h*hd, pos, c);
-                float *w32=falloc(nh);
                 matmul_qt(w32, x+(int64_t)s*D, &m->ix_wp[layer], 1);
                 float wsc=1.f/sqrtf((float)nh), rs=1.f/sqrtf((float)hd);
-                float *isc=falloc(nk);
                 for(int t=0;t<nk;t++){
                     const float *kt=coli_kv_row(ks->Ic[layer],t,hd);
                     float a=0;
@@ -2514,15 +2523,15 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                  * keep-esimo valore piu' grande in O(nk) medio. La soglia (= min del blocco
                  * dei keep maggiori) e' identica a tmp[keep-1] del vecchio qsort, quindi i
                  * due scan qui sotto costruiscono dst[] bit-identical. */
-                float *tmp=falloc(nk); memcpy(tmp,isc,nk*sizeof(float));
+                memcpy(tmp,isc,nk*sizeof(float));
                 partial_select_desc(tmp,nk,keep);
                 float thr=tmp[0]; for(int t=1;t<keep;t++) if(tmp[t]<thr) thr=tmp[t];
                 int *dst=m->dsa_sel+(int64_t)s*dtopk, nd=0;
                 for(int t=0;t<nk && nd<keep;t++) if(isc[t]>thr) dst[nd++]=t;
                 for(int t=0;t<nk && nd<keep;t++) if(isc[t]==thr) dst[nd++]=t;
                 m->dsa_nsel[s]=nd;
-                free(qi); free(w32); free(isc); free(tmp);
             }
+            free(dsa_scratch);
         }
         if(m->dsa_nsel){ dsel=m->dsa_sel; dnsel=m->dsa_nsel; }
     }
