@@ -4318,10 +4318,39 @@ static float *step_all(Model *m, const int *ids, int S, int pos_base){
     layers_forward(m,x,S,pos_base);
     if(m->h_all) memcpy(m->h_all, x, (int64_t)S*D*sizeof(float));   /* hidden di TUTTE le pos (S<=512) */
     if(m->hlast) memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
-    float *lo=falloc((int64_t)S*c->vocab), *row=falloc(D);
-    for(int s=0;s<S;s++){ rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);
-        matmul_qt(lo+(int64_t)s*c->vocab, row, &m->lm_head, 1); }
-    free(x); free(row); return lo;
+    float *lo=falloc((int64_t)S*c->vocab);
+    /* lm_head in UN matmul batch (P#1): the S=1-per-position loop re-streamed the
+     * whole [vocab,D] tensor (~0.5 GB at int4) once per verify position — the
+     * dominant t_head cost of every MTP/grammar verify forward. Batching is done
+     * ONLY when the kernel family provably cannot change with S, so the logits
+     * stay byte-identical to the loop:
+     *   - every fmt where matmul_qt_ex's dispatch is S-independent (0/1/3/4/5);
+     *   - fmt=2 unless the IDOT gate is S-sensitive (g_idot && g_i4s>1) outside
+     *     a SPEC_PIN window (spec_pinned() pins the S=1 family regardless of S);
+     *   - never when Metal's GEMM threshold (S>=g_metal_gemm_min) would pull a
+     *     batched call onto the GPU that the per-row loop never used.
+     * All CPU kernels compute each (o,s) dot independently with the same
+     * accumulation order at any S, so batching alone does not reassociate. */
+    QT *lh=&m->lm_head;
+    int batch_head = S>1;
+#ifdef COLI_METAL
+    if(g_metal_enabled && S>=g_metal_gemm_min) batch_head=0;
+#endif
+    if(lh->fmt==2 && g_idot && g_i4s>1 && !spec_pinned()) batch_head=0;
+    double th0=now_s();
+    if(batch_head){
+        float *norm=falloc((int64_t)S*D);
+        for(int s=0;s<S;s++) rmsnorm(norm+(int64_t)s*D, x+(int64_t)s*D, m->final_norm, D, c->eps);
+        matmul_qt(lo,norm,lh,S);
+        free(norm);
+    } else {
+        float *row=falloc(D);
+        for(int s=0;s<S;s++){ rmsnorm(row, x+(int64_t)s*D, m->final_norm, D, c->eps);
+            matmul_qt(lo+(int64_t)s*c->vocab, row, lh, 1); }
+        free(row);
+    }
+    m->t_head+=now_s()-th0;
+    free(x); return lo;
 }
 
 /* One decode token from each independent sequence, evaluated as a single MoE
