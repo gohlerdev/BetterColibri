@@ -213,7 +213,18 @@ static int coli_cuda_load(void){
     RESOLVE(expert_group_take, fn_expert_group_take)
     RESOLVE(attention_absorb, fn_attention_absorb)
     RESOLVE(tensor_upload,  fn_tensor_upload)
-    RESOLVE(tensor_upload_g, fn_tensor_upload_g)
+    /* OPTIONAL (H7): an older coli_cuda.dll predates the grouped-int4 upload.
+     * The engine's contract (qt_cuda_upload in colibri.c) is that a missing _g
+     * symbol means "fmt=4 tensors stay CPU-side", handled by the NULL-checked
+     * wrapper below — so resolve WITHOUT the fatal RESOLVE() arm. Previously the
+     * fatal resolve made the graceful wrapper dead code and an old DLL disabled
+     * CUDA entirely, contradicting the engine comment. */
+    _Pragma("GCC diagnostic push")
+    _Pragma("GCC diagnostic ignored \"-Wcast-function-type\"")
+    g_cuda.tensor_upload_g = (fn_tensor_upload_g)GetProcAddress(g_cuda.dll, "coli_cuda_tensor_upload_g");
+    _Pragma("GCC diagnostic pop")
+    if(!g_cuda.tensor_upload_g)
+        fprintf(stderr, "[CUDA] coli_cuda.dll predates grouped-int4 upload: fmt=4 tensors stay CPU-side\n");
     RESOLVE(matmul,         fn_matmul)
     RESOLVE(tensor_free,    fn_tensor_free)
     RESOLVE(tensor_bytes,   fn_tensor_bytes)

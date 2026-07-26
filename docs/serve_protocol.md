@@ -8,7 +8,7 @@ stalls byte-counted reads (#195).
 
 | protocol | entry | selected by | used by |
 |---|---|---|---|
-| **mux** (continuous batching, up to 16 KV slots) | `run_serve_mux` | `SERVE_BATCH=1` | `openai_server.py`, `coli web` |
+| **mux** (continuous batching, up to 512 KV slots engine-side; the gateway currently drives ≤16) | `run_serve_mux` | `SERVE_BATCH=1` | `openai_server.py`, `coli web` |
 | **legacy** (single slot, interactive) | `run_serve` | `SERVE=1` (without `SERVE_BATCH`) | `coli chat` |
 
 This document is the reference for the **mux** protocol; the legacy protocol is
@@ -54,22 +54,25 @@ one row per forward.
 Per request, in order:
 
 ```
-DATA <id> <n>\n<n bytes of UTF-8>\n        # a decoded token's text; repeated
-TOPK <id> 5 <logprob> <hextext> ... ×5     # candidates for the sampled token (SERVE_TOPK=1)
-HITS <rows> <cols> <hex>                   # ~every 6 tokens: routed-expert bitmap since last HITS
-REPIN <layer> <eid> <old_tier> <gpu>       # live re-pin swap events, as they happen
-...
+DATA <id> <n>\n<n bytes of UTF-8>\n          # a decoded token's text; repeated
+HITS <rows> <cols> <hex>                    # routed-expert bitmap since the last HITS
 DONE <id> STAT <emitted> <tok_s> <hit_pct> <rss_gb> <prompt_tokens> <length_limited>
 ```
 
-Errors replace the stream: `ERROR <id> <CODE>` with codes `BAD_FRAME`, `BAD_REQUEST`,
-`SLOT_BUSY`, `DUPLICATE_ID`, `EMPTY_PROMPT`, `NOT_FOUND` (CANCEL of unknown id),
-`CANCELLED`. A `CANCEL` is acknowledged by `ERROR <id> CANCELLED` after the slot's KV
-is persisted.
-
 Immediately before each `DONE` the engine emits a telemetry block for the finished
-turn: `HWINFO`, `PERF`, `ENTROPY`, `GPUS`, `TIERS`, `EMAP`, `HITS` (formats below).
-`.coli_usage` is persisted at every turn end, not only at exit.
+turn: `HWINFO`, `PROF`, `TIERS`, `EMAP`, `HITS` (formats below). `.coli_usage` is
+persisted at every turn end, not only at exit.
+
+Errors replace the stream: `ERROR <id> <CODE>` with codes `BAD_FRAME`, `BAD_REQUEST`,
+`SLOT_BUSY`, `DUPLICATE_ID`, `EMPTY_PROMPT`, `CONTEXT_EXCEEDED <used> <limit>`,
+`NOT_FOUND` (CANCEL of unknown id), `CANCELLED`. A `CANCEL` is acknowledged by
+`ERROR <id> CANCELLED` after the slot's KV is persisted.
+
+> Planned-but-not-yet-emitted line kinds (`PERF`, `ENTROPY`, `GPUS`, `TOPK`) were
+> documented here before they existed; they are NOT currently printed. `REPIN`
+> events go to **stderr** (`REPIN_VERBOSE=1`), not the protocol stream. Servers
+> must ignore unknown line kinds regardless — that rule is what lets these lines
+> land later without breaking deployed gateways.
 
 ## Telemetry lines
 
@@ -79,22 +82,17 @@ turn: `HWINFO`, `PERF`, `ENTROPY`, `GPUS`, `TIERS`, `EMAP`, `HITS` (formats belo
 | `HWINFO` | `HWINFO <cores> <ram_total> <ram_avail> <ngpu> <vram_total> <cpu>\|<gpu>` | host snapshot (GBs are floats) |
 | `EMAP` | `EMAP <rows> <cols> <hex>` | one byte per expert, row-major over `rows×cols` (sparse layers +MTP × experts): `byte = (tier<<6) \| heat` — 2-bit tier (0 disk / 1 RAM / 2 VRAM), 6-bit log₂-bucketed usage heat |
 | `HITS` | `HITS <rows> <cols> <hex>` | 1 bit per expert, experts routed since the previous `HITS` |
-| `PERF` | `PERF <id> <dt> <t_edisk> <t_ewait> <t_emm> <t_attn> <t_kvb> <t_head>` | this turn's PROFILO deltas, seconds |
-| `ENTROPY` | `ENTROPY <h0> <h1> …` | per-sparse-layer routing entropy of the turn, bits |
-| `GPUS` | `GPUS <n> (<used_gb> <total_gb> <experts>)×n` | per-device VRAM + resident expert count (CUDA builds) |
-| `TOPK` | `TOPK <id> 5 (<logprob> <hextext>)×5` | token text hex-encoded so the line stays line-shaped |
-| `REPIN` | `REPIN <layer> <eid> <old_tier> <gpu>` | one line per hot-store swap (`REPIN=n` mode) |
+| `PROF` | `PROF <wall_s> <prompt> <completion> <edisk> <ewait> <emm> <attn> <head> <n_fw>` | this turn's phase wall times, seconds |
 
 All telemetry is advisory: servers render what they know and skip the rest.
 
 ## HTTP surface (`openai_server.py`)
 
-- `POST /v1/chat/completions` — OpenAI-compatible; streaming responses emit one extra
-  SSE frame `data: {"colibri": {stats, perf, topk, entropy, gpus, repin}}` immediately
-  before `data: [DONE]`; non-streaming responses attach the same object as a
-  `"colibri"` field.
-- `GET /experts` — the latest `EMAP`/`HITS` state: `{rows, cols, map, hits, seq,
-  gpus, entropy, repin}`.
+- `POST /v1/chat/completions`, `POST /v1/completions` — OpenAI-compatible;
+  `POST /v1/messages` — Anthropic Messages API over the same generation path.
+- `GET /health` — `{status: ok|degraded}`; scheduler/tiers/hwinfo details when authed.
+- `GET /experts` — the latest `EMAP`/`HITS` state: `{rows, cols, map, hits, seq}` (authed).
+- `GET /profile` — rolling per-turn `PROF` snapshots: `{seq, turns[≤120]}` (authed).
 - `GET /*` — static hosting of `web/dist` (SPA fallback, path-traversal-safe), plus
   `experts.json` if published there (the measured expert atlas, #175/#218).
 
