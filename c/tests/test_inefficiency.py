@@ -26,7 +26,20 @@ from tools.efficiency import (
 
 HERE = Path(__file__).resolve().parent
 C_DIR = HERE.parent
-ENGINE = C_DIR / "glm.exe"
+
+def _find_engine() -> Path:
+    """The engine binary next to the sources. Since #391 the build produces
+    `colibri` (`colibri.exe` on Windows); `glm`/`glm.exe` remain as fallbacks
+    for older trees — the same resolution order openai_server.default_engine
+    uses (#526 fixed the gateway; this fixes the test suite, which kept
+    skipping with 'glm.exe not built' even after a successful make)."""
+    for name in ("colibri", "colibri.exe", "glm", "glm.exe"):
+        cand = C_DIR / name
+        if cand.exists():
+            return cand
+    return C_DIR / "colibri"
+
+ENGINE = _find_engine()
 TINY = C_DIR / "glm_tiny"
 
 
@@ -46,7 +59,7 @@ def _engine_present() -> bool:
 def _skip_reason() -> str:
     """Name exactly which prerequisite is missing, so the skip is actionable."""
     if not ENGINE.exists():
-        return "glm.exe not built (run: make glm.exe)"
+        return "engine not built (run: make)"
     if not (TINY / "config.json").exists():
         return "glm_tiny fixture absent (gitignored; ship it locally or run tools/make_glm_oracle.py)"
     return ""
@@ -160,17 +173,26 @@ class TinyEfficiencyTest(unittest.TestCase):
     def test_cpu_vs_cpu_determinism(self):
         """Two greedy REPLAY runs with the same seed produce identical telemetry.
 
-        TEMP=0 = greedy (no sampling), so tok/s and hit-rate must be reproducible.
+        TEMP=0 = greedy (no sampling), so the DETERMINISTIC telemetry (hit rate,
+        i.e. which experts were routed and found resident) must be identical.
         A drift here means non-determinism crept into the decode path (stray
         threading, uninitialized state) — which on a real model would make A/B
-        comparisons meaningless."""
+        comparisons meaningless.
+
+        tok/s is deliberately NOT compared between runs: on the tiny model a
+        full decode takes ~20 ms, so wall-clock throughput is scheduler noise,
+        not an engine property (measured: >2x run-to-run variance at NGEN=8 —
+        the old 25% tolerance failed ~1 run in 3 once the suite actually
+        executed; it had been silently skipping on the stale glm.exe name).
+        Timing gets a sanity bound only: positive and finite."""
         a = self._run(REPLAY="1", TEMP="0", NGEN="8", SEED="1")
         b = self._run(REPLAY="1", TEMP="0", NGEN="8", SEED="1")
         self.assertEqual(a["returncode"], 0)
         self.assertEqual(b["returncode"], 0)
         self.assertEqual(a["hit_pct"], b["hit_pct"], "greedy hit-rate drifted between runs")
-        # tok/s within 25% — exact equality is too strict across scheduler noise.
-        self.assertLess(abs(a["tok_s"] - b["tok_s"]) / max(a["tok_s"], b["tok_s"]), 0.25)
+        for name, t in (("first", a), ("second", b)):
+            self.assertGreater(t["tok_s"], 0, f"{name} run reported non-positive tok/s")
+            self.assertLess(t["tok_s"], 1e9, f"{name} run reported absurd tok/s")
 
 
 @unittest.skipUnless(_cuda_available(),

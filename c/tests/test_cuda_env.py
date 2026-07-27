@@ -20,7 +20,17 @@ from pathlib import Path
 
 
 HERE = Path(__file__).resolve().parent.parent
-GLM = HERE / ("glm.exe" if sys.platform == "win32" else "glm")
+
+def _find_engine() -> Path:
+    """`colibri` since #391, older `glm` names as fallbacks (same order as the
+    gateway's default_engine, #526)."""
+    for name in ("colibri", "colibri.exe", "glm", "glm.exe"):
+        cand = HERE / name
+        if cand.exists():
+            return cand
+    return HERE / "colibri"
+
+GLM = _find_engine()
 
 
 def _binary_has_cuda():

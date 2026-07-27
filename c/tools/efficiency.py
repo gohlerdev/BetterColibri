@@ -389,12 +389,21 @@ def run_engine(
 ) -> tuple[dict, subprocess.CompletedProcess]:
     """Run the engine with an env overlay; return (parsed_telemetry, proc).
 
-    `engine` defaults to ./glm.exe (colibri's Windows host). `snap` defaults to
+    `engine` defaults to the binary next to the sources (`colibri`, with the
+    pre-#391 `glm`/`glm.exe` names as fallbacks — same order as the gateway's
+    default_engine, #526). `snap` defaults to
     the bundled tiny model (glm_tiny) so callers can omit it for fast tests.
     The positional argv is `cap ebits dbits`, matching the engine's main().
     """
     if engine is None:
-        engine = str(Path(__file__).resolve().parent.parent / "glm.exe")
+        c_dir = Path(__file__).resolve().parent.parent
+        for name in ("colibri", "colibri.exe", "glm", "glm.exe"):
+            cand = c_dir / name
+            if cand.exists():
+                engine = str(cand)
+                break
+        else:
+            engine = str(c_dir / "colibri")
     env = os.environ.copy()
     # Strip CUDA vars by default so a CPU run isn't accidentally GPU-accelerated
     # by a leftover env; callers opt in by passing them in env_overlay.
