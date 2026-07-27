@@ -87,6 +87,7 @@ typedef struct {
     float gqa_inv[128], gqa_mscale;               /* tabella RoPE (default o yarn) per le famiglie GQA */
     int v4, rope_hd, o_groups, o_lora;            /* deepseek_v4: MQA K==V + mHC (V4_DESIGN stadio b) */
     int hc_mult, hc_iters; float hc_eps, swiglu;
+    unsigned char hash_layer[128];                /* stadio e: mlp_layer_types[i]=="hash_moe" */
     int n_group, topk_group, norm_topk;
     int score_func;                              /* 0=sigmoid (GLM/DSv3), 1=softmax (Qwen3), 2=sqrtsoftplus (DSv4) */
     int n_hash_layers;                           /* DSv4: first N layers route by token-ID table (tid2eid) */
@@ -148,6 +149,7 @@ typedef struct {
     float *xb_gate, *xb_up, *xb_down;             /* [E*I],[E*I],[E*D] */
     /* deepseek_v4: MQA + grouped-O + mHC (V4_DESIGN stadio b) */
     QT kv_proj, o_b; float *o_a_w; float *kv_ln;   /* o_a: block-diag f32 [g*olr, H*hd/g] */
+    int32_t *tid2eid;                              /* hash layer (stadio e): [vocab, topk], -1 = slot vuoto */
     float *hc_attn_fn, *hc_attn_base, *hc_attn_scale;   /* [(2+hc)*hc, hc*D], [(2+hc)*hc], [3] */
     float *hc_ffn_fn,  *hc_ffn_base,  *hc_ffn_scale;
 #ifdef COLI_CUDA
@@ -246,6 +248,8 @@ typedef struct {
     int has_mtp; Layer mtpL; QT eh_proj;
     float *enorm, *hnorm, *mtp_norm;
     float *hlast, *h_all;                        /* hidden pre-norm: ultima pos / tutte le pos batch */
+    const int *cur_ids; int cur_ids_n;           /* DSv4 hash routing: token id del forward corrente
+                                                  * (righe 0..S-1 di moe(); i driver li impostano) */
     uint64_t mtp_prop, mtp_acc;                  /* statistica acceptance */
     int **eroute; int *enr;                      /* metodo C: routing dell'ULTIMO token per layer */
     uint64_t eclock, hits, miss, ereq;
@@ -1059,11 +1063,14 @@ static void load_cfg(Cfg *c, const char *snap){
                 c->swa[i]=c->sliding;
             } }
           { jval *ml=json_get(r,"mlp_layer_types");
-            if(ml&&ml->t==J_ARR) for(int i=0;i<ml->len;i++)
-                if(ml->kids[i]->t==J_STR && ml->kids[i]->str && strcmp(ml->kids[i]->str,"moe")){
-                    fprintf(stderr,"config: deepseek_v4 mlp_layer_types[%d]='%s' not supported yet "
-                                   "(hash_moe wiring pending)\n",i,ml->kids[i]->str);
+            int nhash=0;
+            if(ml&&ml->t==J_ARR) for(int i=0;i<ml->len && i<128;i++){
+                const char *t=(ml->kids[i]->t==J_STR)?ml->kids[i]->str:NULL;
+                if(t && !strcmp(t,"hash_moe")){ c->hash_layer[i]=1; nhash++; }
+                else if(t && strcmp(t,"moe")){
+                    fprintf(stderr,"config: deepseek_v4 mlp_layer_types[%d]='%s' unsupported\n",i,t);
                     exit(1); } }
+            if(nhash) fprintf(stderr,"[V4] hash routing on %d layer(s): expert sets known from token ids\n",nhash); }
           c->n_experts=gi(r,"n_routed_experts");
           if(c->n_experts<1) c->n_experts=gi(r,"num_local_experts");
           /* HF droppa intermediate_size dal to_dict (alias di moe_inter in V4):
@@ -1548,13 +1555,24 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
                 memset(l->router_bias,0,(size_t)E*sizeof(float));
             } else {
             l->router=ld(m,P("mlp.gate.weight"));
+            if(c->v4 && i<128 && c->hash_layer[i]){
+                /* DSv4 hash layer (stadio e): selezione dalla tabella tid2eid
+                 * [vocab, topk] (I64 nel checkpoint -> i32 qui, OOB -> -1);
+                 * il gate HashRouter non ha bias di correzione. */
+                l->tid2eid=malloc((size_t)c->vocab*c->topk*sizeof(int32_t));
+                if(!l->tid2eid){ fprintf(stderr,"OOM tid2eid layer %d\n",i); exit(1); }
+                st_read_i64_as_i32(&m->S,P("mlp.gate.tid2eid"),l->tid2eid);
+                l->router_bias=(float*)qalloc((size_t)c->n_experts*sizeof(float));
+                memset(l->router_bias,0,(size_t)c->n_experts*sizeof(float));
+            }
             if(c->gqa && !c->v4){
                 /* Qwen3: router softmax puro, senza bias di correzione e senza
                  * shared expert. Bias a zero = percorso FASE A invariato. */
                 l->router_bias=(float*)qalloc((size_t)c->n_experts*sizeof(float));
                 memset(l->router_bias,0,(size_t)c->n_experts*sizeof(float));
             } else {
-            l->router_bias=ld(m,P("mlp.gate.e_score_correction_bias"));
+            if(!(c->v4 && i<128 && c->hash_layer[i]))       /* hash layer: bias assente, gia' a zero */
+                l->router_bias=ld(m,P("mlp.gate.e_score_correction_bias"));
             int sI=c->moe_inter*c->n_shared;
             l->sh_gate = qt_load(m,P("mlp.shared_experts.gate_proj.weight"), sI, D, dbits);
             l->sh_up   = qt_load(m,P("mlp.shared_experts.up_proj.weight"),   sI, D, dbits);
@@ -3438,6 +3456,28 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         route_group_mask(choice,E,c->n_group,c->topk_group);   /* DSv3: no-op when n_group==1 */
         int *idx=idxs+(int64_t)s*K; float *w=ws+(int64_t)s*K;
         int Ksel = g_topk>0 ? (g_topk<K?g_topk:K) : K;
+        /* DSv4 hash layer (stadio e): indici dalla tabella tid2eid[token], pesi
+         * = score sqrtsoftplus a quegli indici, normalizzati (HashRouter). La
+         * selezione non dipende dall'hidden: niente bias, niente group mask. */
+        if(c->v4 && l->tid2eid && m->cur_ids && s<m->cur_ids_n){
+            int hn=hash_route_select(l->tid2eid,c->vocab,K,E,m->cur_ids[s],idx);
+            if(hn>0){
+                float sm=1e-20f;
+                for(int kk=0;kk<hn;kk++){ w[kk]=logit[idx[kk]]; sm+=w[kk]; }
+                for(int kk=0;kk<hn;kk++) w[kk]=w[kk]/sm*c->routed_scale;
+                keff[s]=hn; m->ereq+=hn;
+                for(int kk=0;kk<hn;kk++){
+                    m->eusage[layer][idx[kk]]++; ehit_mark(m,layer,idx[kk]);
+                    if(need_classify){ int e=idx[kk];
+                        if(!touched[e]){ m->elast_pre[layer][e]=m->elast_dc[layer][e]; touched[e]=1; }
+                        m->elast_dc[layer][e]=++m->eaccess_clock_dc; }
+                    if(m->eheat[layer][idx[kk]]<UINT32_MAX) m->eheat[layer][idx[kk]]++;
+                    m->elast[layer][idx[kk]]=++m->eaccess_clock;
+                }
+                for(int d=0;d<D;d++) out[(int64_t)s*D+d]=0;
+                continue;
+            }
+        }
         if(do_cache_route){
             /* Full ranking of top rank_cap experts by choice (bias-augmented). */
             int Mwin=rank_cap;
@@ -5037,7 +5077,9 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
+    m->cur_ids=ids; m->cur_ids_n=S;
     layers_forward(m,x,S,pos_base);
+    m->cur_ids=NULL; m->cur_ids_n=0;
     if(m->hlast) memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
     if(m->has_mtp && S>=2 && g_draft>0) mtp_absorb(m, ids+1, x, S-1, pos_base);
     float *last=falloc(D); rmsnorm(last, x+(int64_t)(S-1)*D, m->final_norm, D, c->eps);
@@ -5052,7 +5094,9 @@ static float *step_all(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
+    m->cur_ids=ids; m->cur_ids_n=S;
     layers_forward(m,x,S,pos_base);
+    m->cur_ids=NULL; m->cur_ids_n=0;
     if(m->h_all) memcpy(m->h_all, x, (int64_t)S*D*sizeof(float));   /* hidden di TUTTE le pos (S<=512) */
     if(m->hlast) memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
     float *lo=falloc((int64_t)S*c->vocab);
@@ -5114,7 +5158,11 @@ static float *step_decode_batch(Model *m, const DecodeRow *rows, int S){
         kvs[s]=rows[s].kv; positions[s]=rows[s].pos;
         embed_row(m,rows[s].token,x+(int64_t)s*D);
     }
+    { static _Thread_local int tok_ids[512];
+      for(int s=0;s<S;s++) tok_ids[s]=rows[s].token;
+      m->cur_ids=tok_ids; m->cur_ids_n=S; }
     layers_forward_rows(m,x,S,0,kvs,positions);
+    m->cur_ids=NULL; m->cur_ids_n=0;
     float *norm=falloc((int64_t)S*D);
     for(int s=0;s<S;s++)
         rmsnorm(norm+(int64_t)s*D,x+(int64_t)s*D,m->final_norm,D,c->eps);
@@ -5446,7 +5494,9 @@ static void forward_all(Model *m, const int *ids, int S, int *pred){
     kv_alloc(m,S);
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
+    m->cur_ids=ids; m->cur_ids_n=S;
     layers_forward(m,x,S,0);
+    m->cur_ids=NULL; m->cur_ids_n=0;
     float *lo=falloc(c->vocab);
     float *row=falloc(D);
     for(int s=0;s<S;s++){

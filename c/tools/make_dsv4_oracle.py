@@ -1,5 +1,5 @@
-"""Oracolo DeepSeek-V4 (stadio b del V4_DESIGN: tutti i layer sliding_attention,
-tutti i MoE "moe" — config VALIDA perche' compress/hash sono per-layer).
+"""Oracolo DeepSeek-V4 (stadi b+e del V4_DESIGN: tutti i layer
+sliding_attention; il PRIMO MoE e' hash_moe con tid2eid random non banale).
 Novita' vs le famiglie gia' validate:
   - mHC hyper-connections: residuo a hc_mult=4 stream paralleli, mixing
     pre/post/comb con proiezione Sinkhorn (20 iter) per sublayer + hyper head;
@@ -56,7 +56,7 @@ cfg = DeepseekV4Config(
     norm_topk_prob=True,
     sliding_window=8,
     layer_types=["sliding_attention"] * 3,
-    mlp_layer_types=["moe"] * 3,
+    mlp_layer_types=["hash_moe", "moe", "moe"],   # stadio e: primo layer hash
     hc_mult=HC,
     hc_sinkhorn_iters=20,
     hc_eps=1e-6,
@@ -83,9 +83,15 @@ with torch.no_grad():
                 p.copy_(torch.linspace(-0.5, 0.5, p.numel()))
             elif p.dim() == 2:
                 p.normal_(0, 0.02)
-    for layer in model.model.layers:
-        layer.mlp.gate.e_score_correction_bias.copy_(
-            torch.linspace(-0.3, 0.3, cfg.n_routed_experts))
+    for li, layer in enumerate(model.model.layers):
+        if hasattr(layer.mlp.gate, "e_score_correction_bias"):
+            layer.mlp.gate.e_score_correction_bias.copy_(
+                torch.linspace(-0.3, 0.3, cfg.n_routed_experts))
+        if hasattr(layer.mlp.gate, "tid2eid"):
+            g = torch.Generator().manual_seed(li)   # tabella hash NON banale
+            layer.mlp.gate.tid2eid.copy_(
+                torch.randint(0, cfg.n_routed_experts, layer.mlp.gate.tid2eid.shape,
+                              generator=g))
 
 prompt = [5, 40, 210, 66, 9, 150, 88, 17, 231, 104, 44, 172]
 ids = torch.tensor([prompt])

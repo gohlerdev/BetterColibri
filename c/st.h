@@ -62,6 +62,7 @@ static int st_dtype_code(const char *s) {
     if (!strcmp(s, "F32"))  return 2;
     if (!strcmp(s, "U8"))   return 3;   /* dati quantizzati (int4 packed / int8) */
     if (!strcmp(s, "I8"))   return 3;
+    if (!strcmp(s, "I64"))  return 4;   /* tabelle indici (DSv4 tid2eid) */
     fprintf(stderr, "unsupported dtype: %s\n", s); exit(1);
 }
 
@@ -340,7 +341,7 @@ static void st_init_multi(shards *S, const char *snap_dir, const char *extra_dir
              * into a caller-sized buffer, so a header with numel != nbytes/esz is an
              * OOB write primitive. U8/I8 (raw quant bytes) are read by byte count, so
              * their numel is unused by the read path and legitimately may differ. */
-            { int esz = t->dtype==2 ? 4 : (t->dtype==3 ? 1 : 2);
+            { int esz = t->dtype==2 ? 4 : (t->dtype==3 ? 1 : (t->dtype==4 ? 8 : 2));
               if (t->dtype != 3 && t->nbytes != numel * (int64_t)esz) {
                   fprintf(stderr, "%s: tensor '%s' numel %lld disagrees with byte span %lld (esz %d)\n",
                           files[fi], name, (long long)numel, (long long)t->nbytes, esz); exit(1); } }
@@ -398,6 +399,23 @@ static void st_prefetch_rep(shards *S, const char *name, int rep) {
 
 /* legge un tensore in un buffer float32 fornito dal chiamante (numel float).
  * drop=1 -> consiglia al kernel di scartare le pagine (per gli expert in streaming). */
+/* Lettura i64 -> int32 (DSv4 tid2eid: valori sono indici expert < 4096; un
+ * valore fuori i32 viene tagliato a -1 e il chiamante lo scarta). */
+static int64_t st_read_i64_as_i32(shards *S, const char *name, int32_t *out) {
+    st_tensor *t = st_find(S, name);
+    if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
+    if (t->dtype != 4 || t->numel < 0 || t->numel * 8 != t->nbytes) {
+        fprintf(stderr, "%s: expected I64 index table (numel %lld, %lld bytes, dtype %d)\n",
+                name, (long long)t->numel, (long long)t->nbytes, t->dtype); exit(1); }
+    int64_t *raw = malloc(t->nbytes);
+    if (!raw) { fprintf(stderr, "malloc %lld bytes for %s failed\n", (long long)t->nbytes, name); exit(1); }
+    st_pread_full(t->fd, raw, t->nbytes, t->off, "pread i64");
+    for (int64_t i = 0; i < t->numel; i++)
+        out[i] = (raw[i] >= 0 && raw[i] < (1<<30)) ? (int32_t)raw[i] : -1;
+    free(raw);
+    return t->numel;
+}
+
 static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
