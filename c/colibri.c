@@ -83,6 +83,8 @@ typedef struct {
     int hidden, n_layers, n_heads, n_experts, topk, moe_inter, dense_inter;
     int first_dense, q_lora, kv_lora, qk_nope, qk_rope, qk_head, v_head, n_shared, vocab;
     int gqa, n_kv_heads, head_dim;                /* famiglia GQA (qwen3_moe): K/V per testa */
+    int oss, sliding; int swa[128];               /* gpt_oss: sinks/bias/finestra scorrevole per layer */
+    float gqa_inv[128], gqa_mscale;               /* tabella RoPE (default o yarn) per le famiglie GQA */
     int n_group, topk_group, norm_topk;
     int score_func;                              /* 0=sigmoid (GLM/DSv3), 1=softmax (Qwen3), 2=sqrtsoftplus (DSv4) */
     int n_hash_layers;                           /* DSv4: first N layers route by token-ID table (tid2eid) */
@@ -139,6 +141,9 @@ typedef struct {
     QT q_a, q_b, kv_a, kv_b, o; float *q_a_ln, *kv_a_ln;
     /* GQA (qwen3_moe): proiezioni classiche + norme per-head */
     QT q_proj, k_proj, v_proj; float *q_norm, *k_norm;
+    /* gpt_oss: bias attention, sink per testa, bias router/expert (residenti f32) */
+    float *qb, *kb, *vb, *ob, *sinks, *router_lin_bias;
+    float *xb_gate, *xb_up, *xb_down;             /* [E*I],[E*I],[E*D] */
 #ifdef COLI_CUDA
     ColiCudaTensor *kv_b_shard[COLI_CUDA_MAX_DEVICES];
     int shard_h0[COLI_CUDA_MAX_DEVICES],shard_hn[COLI_CUDA_MAX_DEVICES],n_kv_b_shard;
@@ -280,6 +285,30 @@ static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S)
     else if(!g_no_fused_pair&&S==1&&wg->fmt==4&&wu->fmt==4&&wg->I==wu->I&&wg->O==wu->O&&wg->gs==wu->gs)
         matmul_i4_grouped_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,S,wg->I,wg->O,wg->gs);
     else { matmul_qt(g,x,wg,S); matmul_qt(u,x,wu,S); }
+}
+
+/* gpt_oss expert activation: gate/up con bias, clamp (gate<=7, |up|<=7),
+ * glu = gate*sigmoid(1.702*gate), act = (up+1)*glu — GptOssExperts._apply_gate,
+ * pinnata float-level da make_gptoss_oracle --l0check. Sostituisce silu*up. */
+static void oss_expert_act(const Cfg *c, Layer *l, int eid, float *gg, float *uu, int nr){
+    int I=c->moe_inter;
+    const float *bg=l->xb_gate+(int64_t)eid*I, *bu=l->xb_up+(int64_t)eid*I;
+    for(int r=0;r<nr;r++){
+        float *g=gg+(int64_t)r*I, *u=uu+(int64_t)r*I;
+        for(int i=0;i<I;i++){
+            float gv=g[i]+bg[i], uv=u[i]+bu[i];
+            if(gv>7.f) gv=7.f;
+            if(uv>7.f) uv=7.f; else if(uv<-7.f) uv=-7.f;
+            float glu=gv/(1.f+expf(-1.702f*gv));
+            g[i]=(uv+1.f)*glu;
+        }
+    }
+}
+/* bias down_proj (dopo matmul_qt su hh, prima della pesatura) */
+static void oss_down_bias(const Cfg *c, Layer *l, int eid, float *hh, int nr){
+    const float *bd=l->xb_down+(int64_t)eid*c->hidden;
+    for(int r=0;r<nr;r++){ float *h=hh+(int64_t)r*c->hidden;
+        for(int d=0;d<c->hidden;d++) h[d]+=bd[d]; }
 }
 
 static int g_repin;
@@ -623,6 +652,7 @@ static inline float softplusf(float x){
 static void route_score(float *logit, int E, int score_func){
     if(score_func==1){ softmax(logit,E); return; }
     if(score_func==2){ for(int e=0;e<E;e++) logit[e]=sqrtf(softplusf(logit[e])); return; }
+    if(score_func==3) return;   /* gpt_oss: topk sui logit GREZZI, softmax dopo la selezione */
     for(int e=0;e<E;e++) logit[e]=sigmoidf(logit[e]);
 }
 /* DSv4 hash routing lookup: expert indices for `token` at a hash layer, from a
@@ -917,17 +947,18 @@ static void rope_interleave(float *v, int pos, const Cfg *c){
     }
 }
 
-/* RoPE split-half (rotate_half, Llama/Qwen): coppie (v[j], v[half+j]) invece
- * delle coppie adiacenti dell'interleaved. E' la rotazione che Qwen3 applica a
- * TUTTO head_dim (non solo a una porzione rope come la MLA DeepSeek); ordine
- * pinnato float-level da tools/make_qwen3_oracle.py --l0check. */
-static void rope_splithalf(float *v, int pos, int hd, float theta){
-    int half=hd/2;
+/* RoPE split-half (rotate_half, Llama/Qwen/OSS): coppie (v[j], v[half+j]) invece
+ * delle coppie adiacenti dell'interleaved. E' la rotazione che le famiglie GQA
+ * applicano a TUTTO head_dim (non solo a una porzione rope come la MLA DeepSeek);
+ * inv_freq da c->gqa_inv (default o YaRN) e attention_scaling su cos/sin, come
+ * transformers. Ordine pinnato float-level dagli oracle --l0check. */
+static void rope_splithalf(float *v, int pos, const Cfg *c){
+    int hd=c->head_dim, half=hd/2;
     if(hd>256){ fprintf(stderr,"head_dim=%d exceeds rope_splithalf buffer (256)\n",hd); exit(1); }
     float in[256]; memcpy(in,v,(size_t)hd*sizeof(float));
     for(int j=0;j<half;j++){
-        float inv=powf(theta,-2.0f*j/hd),ang=pos*inv;
-        float cs=cosf(ang),sn=sinf(ang);
+        float ang=pos*c->gqa_inv[j];
+        float cs=cosf(ang)*c->gqa_mscale, sn=sinf(ang)*c->gqa_mscale;
         v[j]      = in[j]*cs      - in[half+j]*sn;
         v[half+j] = in[half+j]*cs + in[j]*sn;
     }
@@ -981,13 +1012,28 @@ static void load_cfg(Cfg *c, const char *snap){
      * KVH*head_dim (riga K della cache), qk_rope = KVH*head_dim (riga V: la
      * Rc esiste gia' per-token, dimensionata a qk_rope). */
     { jval *mt=json_get(r,"model_type");
-      c->gqa = mt && mt->t==J_STR && mt->str && !strcmp(mt->str,"qwen3_moe");
+      const char *mts = (mt && mt->t==J_STR) ? mt->str : NULL;
+      c->gqa = mts && (!strcmp(mts,"qwen3_moe") || !strcmp(mts,"gpt_oss"));
+      c->oss = mts && !strcmp(mts,"gpt_oss");
       if(c->gqa){
           c->n_kv_heads=gi(r,"num_key_value_heads");
           c->head_dim=gi(r,"head_dim");
           if(c->head_dim<1 && c->n_heads>0) c->head_dim=c->hidden/c->n_heads;
           c->n_experts=gi(r,"num_experts");
           if(c->n_experts<1) c->n_experts=gi(r,"num_local_experts");  /* alias HF to_dict */
+          if(c->oss){
+              /* gpt_oss: gli expert usano intermediate_size (non esiste moe_inter);
+               * router topk-then-softmax (score_func=3), bias lineari ovunque. */
+              c->moe_inter=c->dense_inter;
+              c->sliding=gi(r,"sliding_window");
+              jval *lt=json_get(r,"layer_types");
+              for(int i=0;i<c->n_layers && i<128;i++){
+                  int sw = (i%2)==0;               /* default HF: pari=sliding */
+                  if(lt && lt->t==J_ARR && i<lt->len && lt->kids[i]->t==J_STR && lt->kids[i]->str)
+                      sw = !strcmp(lt->kids[i]->str,"sliding_attention");
+                  c->swa[i] = sw ? c->sliding : 0;
+              }
+          }
           c->first_dense=0;                       /* tutti i layer sono MoE */
           c->n_shared=0;                          /* nessun shared expert */
           c->q_lora=0;
@@ -996,12 +1042,13 @@ static void load_cfg(Cfg *c, const char *snap){
           c->qk_head=c->head_dim;
           c->kv_lora=c->n_kv_heads*c->head_dim;   /* riga K cache (Lc) */
           c->qk_rope=c->n_kv_heads*c->head_dim;   /* riga V cache (Rc) */
-          c->score_func=1;                        /* router softmax, sempre */
+          c->score_func=c->oss?3:1;               /* qwen3: softmax; oss: topk-then-softmax */
           if(c->n_kv_heads<1 || c->n_heads%c->n_kv_heads){
               fprintf(stderr,"config: num_key_value_heads=%d must divide num_attention_heads=%d\n",
                       c->n_kv_heads,c->n_heads); exit(1); }
-          fprintf(stderr,"[GQA] qwen3_moe: %d q-heads / %d kv-heads, head_dim %d, %d experts top-%d (softmax router)\n",
-                  c->n_heads,c->n_kv_heads,c->head_dim,c->n_experts,c->topk);
+          fprintf(stderr,"[GQA] %s: %d q-heads / %d kv-heads, head_dim %d, %d experts top-%d (%s router)%s\n",
+                  mts,c->n_heads,c->n_kv_heads,c->head_dim,c->n_experts,c->topk,
+                  c->oss?"topk-softmax":"softmax",c->oss?" + sinks/sliding":"");
       } }
     jval *nt=json_get(r,"norm_topk_prob"); c->norm_topk=(nt&&nt->t==J_BOOL)?nt->boolean:0;
     /* Router scoring function (multi-model): GLM/DeepSeek ship "sigmoid",
@@ -1030,6 +1077,41 @@ static void load_cfg(Cfg *c, const char *snap){
     jval *rs=json_get(r,"routed_scaling_factor"); c->routed_scale=rs?(float)rs->num:1.f;
     jval *rp=json_get(r,"rope_parameters"); jval *th=rp?json_get(rp,"rope_theta"):NULL;
     c->theta = th?(float)th->num:10000.f;
+    /* Tabella RoPE per le famiglie GQA: inv_freq di default o YaRN (gpt_oss),
+     * replica esatta di transformers _compute_yarn_parameters (truncate incluso)
+     * + attention_scaling moltiplicato su cos/sin. Pinnata da make_gptoss_oracle
+     * --l0check. head_dim<=256 -> hd/2 <= 128 slot. */
+    if(c->gqa && c->head_dim>0 && c->head_dim<=256){
+        int hd=c->head_dim, half=hd/2;
+        const char *rt=NULL; jval *rtv=rp?json_get(rp,"rope_type"):NULL;
+        if(rtv&&rtv->t==J_STR) rt=rtv->str;
+        c->gqa_mscale=1.f;
+        if(rt && !strcmp(rt,"yarn")){
+            jval *jf=json_get(rp,"factor"), *jb=json_get(rp,"beta_fast"), *js=json_get(rp,"beta_slow");
+            jval *jo=json_get(rp,"original_max_position_embeddings"), *jt=json_get(rp,"truncate");
+            jval *ja=json_get(rp,"attention_factor");
+            double factor=jf?jf->num:32.0, bf=jb?jb->num:32.0, bs=js?js->num:1.0;
+            double omax=jo?jo->num:4096.0;
+            int trunc=jt&&jt->t==J_BOOL?jt->boolean:1;
+            c->gqa_mscale = ja ? (float)ja->num
+                               : (factor<=1.0 ? 1.f : (float)(0.1*log(factor)+1.0));
+            double lo=(hd*log(omax/(bf*2*M_PI)))/(2*log((double)c->theta));
+            double hi=(hd*log(omax/(bs*2*M_PI)))/(2*log((double)c->theta));
+            if(trunc){ lo=floor(lo); hi=ceil(hi); }
+            if(lo<0) lo=0; if(hi>hd-1) hi=hd-1;
+            for(int j=0;j<half;j++){
+                double pf=pow((double)c->theta,(2.0*j)/hd);
+                double ext=1.0/pf, itp=1.0/(factor*pf);
+                double ramp=(j-lo)/((hi-lo)==0?0.001:(hi-lo));
+                if(ramp<0)ramp=0; if(ramp>1)ramp=1;
+                double extf=1.0-ramp;
+                c->gqa_inv[j]=(float)(itp*(1.0-extf)+ext*extf);
+            }
+        } else {
+            for(int j=0;j<half;j++)
+                c->gqa_inv[j]=(float)(1.0/pow((double)c->theta,(2.0*j)/hd));
+        }
+    }
     /* token di stop: GLM-5.2 ne ha TRE (endoftext, user, observation). Fermarsi solo sul
      * primo = generare spazzatura invisibile dopo la fine del turno (5-10x token sprecati). */
     c->n_stop=0;
@@ -1315,13 +1397,22 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         l->in_ln=ld(m,P("input_layernorm.weight"));
         l->post_ln=ld(m,P("post_attention_layernorm.weight"));
         if(c->gqa){
-            /* Qwen3: q/k/v/o classici + RMSNorm per-head su q e k */
+            /* Qwen3/OSS: q/k/v/o classici; qwen3 aggiunge RMSNorm per-head, oss
+             * aggiunge bias lineari + sink per testa. */
             l->q_proj = qt_load(m,P("self_attn.q_proj.weight"), H*c->head_dim, D, dbits);
             l->k_proj = qt_load(m,P("self_attn.k_proj.weight"), c->n_kv_heads*c->head_dim, D, dbits);
             l->v_proj = qt_load(m,P("self_attn.v_proj.weight"), c->n_kv_heads*c->head_dim, D, dbits);
             l->o      = qt_load(m,P("self_attn.o_proj.weight"), D, H*c->head_dim, dbits);
-            l->q_norm = ld(m,P("self_attn.q_norm.weight"));
-            l->k_norm = ld(m,P("self_attn.k_norm.weight"));
+            if(c->oss){
+                l->qb   = ld(m,P("self_attn.q_proj.bias"));
+                l->kb   = ld(m,P("self_attn.k_proj.bias"));
+                l->vb   = ld(m,P("self_attn.v_proj.bias"));
+                l->ob   = ld(m,P("self_attn.o_proj.bias"));
+                l->sinks= ld(m,P("self_attn.sinks"));
+            } else {
+                l->q_norm = ld(m,P("self_attn.q_norm.weight"));
+                l->k_norm = ld(m,P("self_attn.k_norm.weight"));
+            }
         } else {
         l->q_a   = qt_load(m,P("self_attn.q_a_proj.weight"), c->q_lora, D, dbits);
         l->q_a_ln= ld(m,P("self_attn.q_a_layernorm.weight"));
@@ -1345,6 +1436,24 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             l->up_proj   = qt_load(m,P("mlp.up_proj.weight"),   c->dense_inter, D, dbits);
             l->down_proj = qt_load(m,P("mlp.down_proj.weight"), D, c->dense_inter, dbits);
         } else {
+            if(c->oss){
+                /* gpt_oss: router lineare CON bias e nomi propri; bias expert
+                 * (gate_up interleaved [E,2I] -> de-interleave, down [E,D]) residenti. */
+                l->router=ld(m,P("mlp.router.weight"));
+                l->router_lin_bias=ld(m,P("mlp.router.bias"));
+                float *gub=ld(m,P("mlp.experts.gate_up_proj_bias"));
+                int I=c->moe_inter, E=c->n_experts;
+                l->xb_gate=(float*)qalloc((size_t)E*I*sizeof(float));
+                l->xb_up  =(float*)qalloc((size_t)E*I*sizeof(float));
+                for(int e=0;e<E;e++) for(int ii=0;ii<I;ii++){
+                    l->xb_gate[(int64_t)e*I+ii]=gub[(int64_t)e*2*I+2*ii];
+                    l->xb_up  [(int64_t)e*I+ii]=gub[(int64_t)e*2*I+2*ii+1];
+                }
+                free(gub);
+                l->xb_down=ld(m,P("mlp.experts.down_proj_bias"));
+                l->router_bias=(float*)qalloc((size_t)E*sizeof(float));
+                memset(l->router_bias,0,(size_t)E*sizeof(float));
+            } else {
             l->router=ld(m,P("mlp.gate.weight"));
             if(c->gqa){
                 /* Qwen3: router softmax puro, senza bias di correzione e senza
@@ -1362,6 +1471,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             qt_cuda_colocate(&l->sh_up,&l->sh_gate);
             qt_cuda_colocate(&l->sh_down,&l->sh_gate);
 #endif
+            }
             }
             m->ecache[i]=calloc(cap,sizeof(ESlot));
             m->eroute[i]=calloc(c->topk,sizeof(int));      /* metodo C: ultimo routing del layer */
@@ -2582,34 +2692,50 @@ static void attention_gqa(Model *m, Layer *l, int layer, float *x, int S, int po
     float *Q=falloc((int64_t)S*H*hd), *KK=falloc((int64_t)S*kvw), *VV=falloc((int64_t)S*kvw);
     matmul_qt_ex(Q, x,&l->q_proj,S,0); matmul_qt_ex(KK,x,&l->k_proj,S,0);
     matmul_qt_ex(VV,x,&l->v_proj,S,0);
+    /* gpt_oss: bias lineari sulle proiezioni */
+    if(c->oss){
+        for(int s=0;s<S;s++){
+            for(int i=0;i<H*hd;i++)  Q[(int64_t)s*H*hd+i]+=l->qb[i];
+            for(int i=0;i<kvw;i++){ KK[(int64_t)s*kvw+i]+=l->kb[i]; VV[(int64_t)s*kvw+i]+=l->vb[i]; }
+        }
+    }
     /* per-head RMSNorm (q_norm/k_norm) + RoPE split-half, poi scrivi K/V in cache */
     for(int s=0;s<S;s++){
         int pos = positions?positions[s]:pos_base+s;
         KVState *ks = kvs?kvs[s]:m->kv;
         float *q=Q+(int64_t)s*H*hd;
         for(int h=0;h<H;h++){
-            float tmp[256];
-            rmsnorm(tmp,q+(int64_t)h*hd,l->q_norm,hd,c->eps);
-            memcpy(q+(int64_t)h*hd,tmp,(size_t)hd*sizeof(float));
-            rope_splithalf(q+(int64_t)h*hd,pos,hd,c->theta);
+            if(!c->oss){                          /* qwen3: RMSNorm per-head pre-RoPE */
+                float tmp[256];
+                rmsnorm(tmp,q+(int64_t)h*hd,l->q_norm,hd,c->eps);
+                memcpy(q+(int64_t)h*hd,tmp,(size_t)hd*sizeof(float));
+            }
+            rope_splithalf(q+(int64_t)h*hd,pos,c);
         }
         float *k=KK+(int64_t)s*kvw, *v=VV+(int64_t)s*kvw;
         for(int h=0;h<KVH;h++){
-            float tmp[256];
-            rmsnorm(tmp,k+(int64_t)h*hd,l->k_norm,hd,c->eps);
-            memcpy(k+(int64_t)h*hd,tmp,(size_t)hd*sizeof(float));
-            rope_splithalf(k+(int64_t)h*hd,pos,hd,c->theta);
+            if(!c->oss){
+                float tmp[256];
+                rmsnorm(tmp,k+(int64_t)h*hd,l->k_norm,hd,c->eps);
+                memcpy(k+(int64_t)h*hd,tmp,(size_t)hd*sizeof(float));
+            }
+            rope_splithalf(k+(int64_t)h*hd,pos,c);
         }
         memcpy(coli_kv_row(ks->Lc[layer],pos,c->kv_lora), k, (size_t)kvw*sizeof(float));
         memcpy(coli_kv_row(ks->Rc[layer],pos,c->qk_rope), v, (size_t)kvw*sizeof(float));
     }
-    /* score/softmax/value per riga e testa, causale sulla cache della riga */
+    /* score/softmax/value per riga e testa, causale sulla cache della riga.
+     * gpt_oss: finestra scorrevole per-layer (ultimi `win` token) + un logit
+     * SINK per testa che partecipa alla softmax e viene scartato (diluisce le
+     * probabilita' senza contribuire al value — eager_attention_forward). */
     float *ao=falloc((int64_t)S*H*hd);
+    int win = c->oss && layer<128 ? c->swa[layer] : 0;
     #pragma omp parallel for collapse(2) schedule(static)
     for(int s=0;s<S;s++) for(int h=0;h<H;h++){
         int pos = positions?positions[s]:pos_base+s;
         KVState *ks = kvs?kvs[s]:m->kv;
         int st0 = ks->kv_start[layer]; int Tn = pos+1;
+        if(win>0 && Tn-win>st0) st0=Tn-win;       /* sliding: ultimi win token */
         int kvh = h/grp;
         const float *q = Q+(int64_t)s*H*hd + (int64_t)h*hd;
         float *sc = malloc((size_t)(Tn-st0)*sizeof(float));
@@ -2620,6 +2746,10 @@ static void attention_gqa(Model *m, Layer *l, int layer, float *x, int S, int po
             acc*=c->attn_scale; sc[t-st0]=acc; if(acc>mx) mx=acc;
         }
         float sum=0;
+        if(c->oss){                               /* sink: logit extra, softmax inclusivo */
+            float sk=l->sinks[h]; if(sk>mx) mx=sk;
+            sum=expf(sk-mx);
+        }
         for(int t=0;t<Tn-st0;t++){ sc[t]=expf(sc[t]-mx); sum+=sc[t]; }
         float inv=1.f/(sum+1e-20f);
         float *dst=ao+(int64_t)s*H*hd+(int64_t)h*hd;
@@ -2632,6 +2762,7 @@ static void attention_gqa(Model *m, Layer *l, int layer, float *x, int S, int po
         free(sc);
     }
     matmul_qt_ex(out,ao,&l->o,S,0);
+    if(c->oss) for(int s=0;s<S;s++) for(int d=0;d<c->hidden;d++) out[(int64_t)s*c->hidden+d]+=l->ob[d];
     free(Q); free(KK); free(VV); free(ao);
 }
 
@@ -3106,6 +3237,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         pre_routed=1;
     }
     if(!pre_routed) matmul(logits_all, x, l->router, S, D, E);
+    if(!pre_routed && c->oss && l->router_lin_bias)      /* gpt_oss: bias del router lineare */
+        for(int s=0;s<S;s++) for(int e=0;e<E;e++) logits_all[(int64_t)s*E+e]+=l->router_lin_bias[e];
     if(!pre_routed)
     for(int s=0;s<S;s++){
         float *logit=logits_all+(int64_t)s*E;
@@ -3229,7 +3362,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             if(m->eheat[layer][idx[kk]]<UINT32_MAX) m->eheat[layer][idx[kk]]++;
             m->elast[layer][idx[kk]]=++m->eaccess_clock;
         }
-        if(c->norm_topk){ float sm=0; for(int kk=0;kk<Ke;kk++) sm+=w[kk]; sm+=1e-20f; for(int kk=0;kk<Ke;kk++) w[kk]/=sm; }
+        if(c->score_func==3){ softmax(w,Ke); }        /* gpt_oss: softmax sui top-K selezionati */
+        else if(c->norm_topk){ float sm=0; for(int kk=0;kk<Ke;kk++) sm+=w[kk]; sm+=1e-20f; for(int kk=0;kk<Ke;kk++) w[kk]/=sm; }
         for(int kk=0;kk<Ke;kk++) w[kk]*=c->routed_scale;
         if(g_route_fp){                       /* ROUTE_TRACE: one line per (position, layer) */
             fprintf(g_route_fp,"%d %d %d",g_route_call,s,layer);
@@ -3562,7 +3696,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * on GLM-5.2 int4: identical 256-token greedy output, and on the int4 tiny
          * oracle). Gated off the speculation window like every S-dependent kernel switch. */
         int xexp_done=0;
-        if(g_xexp && !metal_done && S==1 && !nmiss && !spec_pinned() && g_idot && g_i4s<=1
+        if(g_xexp && !c->oss && !metal_done && S==1 && !nmiss && !spec_pinned() && g_idot && g_i4s<=1
 #ifdef COLI_CUDA
            && !g_cuda_enabled
 #endif
@@ -3664,9 +3798,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             if(!e->slab) expert_host_ensure(m,layer,e);
 #endif
             expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-            for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+            if(c->oss) oss_expert_act(c,l,eid,gg,uu,nr);
+            else for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
             if(e->d.fmt==6) e8_rot_rows(gg,nr,I);   /* down input is per-expert — rotate here */
             matmul_qt(hh, gg, &e->d, nr);
+            if(c->oss) oss_down_bias(c,l,eid,hh,nr);
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
             double dt=now_s()-t0;m->t_emm+=dt;if(g_prof){m->t_ecpu+=dt;
@@ -3694,8 +3830,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                         for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)eg_row[gi][r]*D,D*sizeof(float));
                         expert_host_ensure(m,layer,e);
                         expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                        for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                        if(c->oss) oss_expert_act(c,l,e->eid,gg,uu,nr);
+                        else for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
                         matmul_qt(hh,gg,&e->d,nr);
+                        if(c->oss) oss_down_bias(c,l,e->eid,hh,nr);
                         for(int r=0;r<nr;r++){ float *os=out+(int64_t)eg_row[gi][r]*D; float wgt=eg_w[gi][r];
                             for(int d=0;d<D;d++) os[d]+=wgt*hh[(int64_t)r*D+d]; }
                     }
@@ -3786,8 +3924,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     if(!coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
                         expert_host_ensure(m,layer,e);
                         expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                        for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+                        if(c->oss) oss_expert_act(c,l,e->eid,gg,uu,nr);
+                        else for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
                         matmul_qt(hh,gg,&e->d,nr);
+                        if(c->oss) oss_down_bias(c,l,e->eid,hh,nr);
                         if(g_prof){m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d);
                             m->cpu_expert_rows+=(uint64_t)nr;}
                     }
