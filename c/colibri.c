@@ -649,6 +649,11 @@ static int hash_route_select(const int32_t *tid2eid, int vocab, int topk, int E,
  * (GLM path byte-identical). */
 static void route_group_mask(float *choice, int E, int n_group, int topk_group){
     if(n_group<=1 || topk_group>=n_group) return;
+    if(n_group>256){                                 /* CKR bounds this at load; a silent
+                                                      * skip here would be a wrong answer,
+                                                      * so refuse loudly (also keeps
+                                                      * -Wstringop-overflow provably quiet) */
+        fprintf(stderr,"route_group_mask: n_group=%d exceeds 256\n",n_group); exit(1); }
     int gsz=E/n_group;
     float gs[256];                                   /* n_group <= 256 (CKR) */
     for(int g=0;g<n_group;g++){
@@ -659,8 +664,12 @@ static void route_group_mask(float *choice, int E, int n_group, int topk_group){
         gs[g]=m1+(gsz>1?m2:0.f);
     }
     /* keep the topk_group best groups (ties: lower group index wins, matching
-     * torch.topk's first-occurrence tie behavior on equal values) */
-    unsigned char keep[256]; memset(keep,0,(size_t)n_group);
+     * torch.topk's first-occurrence tie behavior on equal values).
+     * The whole fixed array is zeroed (256 B, cost noise): -Wstringop-overflow's
+     * range analysis cannot see the n_group<=256 guarantee across GCC's .part
+     * function split and flagged any n_group-sized memset with a bogus
+     * sign-extended range. */
+    unsigned char keep[256]; memset(keep,0,sizeof(keep));
     for(int r=0;r<topk_group;r++){ int best=-1; float bv=-1e30f;
         for(int g=0;g<n_group;g++) if(!keep[g] && gs[g]>bv){ bv=gs[g]; best=g; }
         if(best<0) break; keep[best]=1; }
