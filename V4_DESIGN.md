@@ -222,7 +222,9 @@ sink-anchored softmax under the reference's causality. TF 32/32 with a live
 HCA layer (rate 4 < window 8, so compressed rows demonstrably matter);
 greedy 20/20 proves the incremental ring.
 
-Remaining stages: (d) CSA + lightning indexer (the Ca/Cb overlap layout +
-scorer — the largest single remaining piece), (f) DSpark. The engine now
-validates SIX architectures end-to-end, V4 in three of its four attention
-modes.
+Stage (d) closed the set the same night (a67b34b): Ca/Cb dual-series overlap
+compression, the indexer's private compressor plane, ReLU top-k selection,
+selected-rows softmax extension — TF 32/32 first run, int8 32/32, all four
+decode rings proven by greedy. **Stages a–e are ALL complete: DeepSeek-V4
+runs in every attention mode it ships.** Only (f) DSpark (optional
+speculative module) remains.

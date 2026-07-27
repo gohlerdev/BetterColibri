@@ -17,13 +17,16 @@ teacher-forcing 32/32 at f32 against transformers, most on the FIRST run:
 | Kimi-K2 stack | serve smoke | DONE frames | tokenizer + gateway + stops (see below) |
 | Qwen3-MoE | 32/32 | 20/20 | GQA attention path (the "universal is earned" unlock) |
 | GPT-OSS | 32/32 | 20/20 | sinks, sliding window, YaRN, clamp-GLU experts |
-| **DeepSeek-V4** | **32/32** | **20/20** | **mHC hyper-connections + MQA attention + HCA compressed KV + hash routing** |
+| **DeepSeek-V4 (complete)** | **32/32** | **20/20** | **mHC + MQA + HCA plane + CSA/lightning-indexer + hash routing** |
 
 The V4 result is the big one: the design doc called CSA/HCA + mHC "a new
-engine core, not a port" — and 3 of V4's 4 attention modes now run
-(sliding, sliding+HCA, hash-MoE; only CSA's lightning indexer remains).
-transformers 5.14 turned out to ship `DeepseekV4ForCausalLM`, which made the
-full oracle ladder possible the same night the design doc was written.
+engine core, not a port" — and by the end of the night **ALL of V4's
+attention modes run**: sliding, HCA compressed plane, CSA with the lightning
+indexer (a67b34b, TF 32/32 and int8 32/32 first run), plus hash routing and
+the 4-stream mHC residual. transformers 5.14 turned out to ship
+`DeepseekV4ForCausalLM`, which made the full oracle ladder possible the same
+night the design doc was written. Of the entire multimodel roadmap only
+DSpark (optional speculation) and real-weight converters remain.
 
 ## Why first-run 32/32 kept happening
 
@@ -73,9 +76,7 @@ What remains for real K2 is only the ~515 GB weight conversion (disk-bound).
 
 ## What's deliberately left
 
-- **CSA + lightning indexer** (V4 stage d): the Ca/Cb overlap layout + scorer.
-  Largest remaining piece; needs its own session.
-- **DSpark** (stage f): optional speculative module.
+- **DSpark** (V4 stage f): optional speculative module.
 - Real-weight converter runs for K2/DSv3/Qwen3/OSS/V4-Flash: disk-bound, not
   possible on this host.
 - GPU kernel work: unchanged deferred bucket (needs hardware).
