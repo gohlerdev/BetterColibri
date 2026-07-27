@@ -1,6 +1,7 @@
-"""Oracolo DeepSeek-V4 (stadi b+c+e del V4_DESIGN: layer 1 e'
-heavily_compressed_attention (rate 4, seq 32 -> 8 righe compresse vive);
-il primo MoE e' hash_moe con tid2eid random non banale).
+"""Oracolo DeepSeek-V4 (stadi b+c+d+e del V4_DESIGN: layer 0 sliding,
+layer 1 HCA rate 4, layer 2 CSA rate 4 + lightning indexer top-3 —
+seq 32 -> 8 righe compresse, index_topk 3 < 7 visibili quindi la
+selezione dell'indexer E' decisiva; primo MoE hash_moe).
 Novita' vs le famiglie gia' validate:
   - mHC hyper-connections: residuo a hc_mult=4 stream paralleli, mixing
     pre/post/comb con proiezione Sinkhorn (20 iter) per sublayer + hyper head;
@@ -56,7 +57,8 @@ cfg = DeepseekV4Config(
     scoring_func="sqrtsoftplus",
     norm_topk_prob=True,
     sliding_window=8,
-    layer_types=["sliding_attention", "heavily_compressed_attention", "sliding_attention"],
+    layer_types=["sliding_attention", "heavily_compressed_attention", "compressed_sparse_attention"],
+    index_n_heads=4, index_head_dim=16, index_topk=3,
     compress_rates={"compressed_sparse_attention": 4, "heavily_compressed_attention": 4},
     mlp_layer_types=["hash_moe", "moe", "moe"],   # stadio e: primo layer hash
     hc_mult=HC,

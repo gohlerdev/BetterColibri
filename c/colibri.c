@@ -89,6 +89,7 @@ typedef struct {
     int hc_mult, hc_iters; float hc_eps, swiglu;
     unsigned char hash_layer[128];                /* stadio e: mlp_layer_types[i]=="hash_moe" */
     unsigned char hca[128]; int hca_rate;         /* stadio c: heavily_compressed_attention */
+    unsigned char csa[128]; int csa_rate;         /* stadio d: compressed_sparse_attention */
     float theta_comp;                             /* rope_parameters.compress.rope_theta */
     int n_group, topk_group, norm_topk;
     int score_func;                              /* 0=sigmoid (GLM/DSv3), 1=softmax (Qwen3), 2=sqrtsoftplus (DSv4) */
@@ -153,6 +154,8 @@ typedef struct {
     QT kv_proj, o_b; float *o_a_w; float *kv_ln;   /* o_a: block-diag f32 [g*olr, H*hd/g] */
     int32_t *tid2eid;                              /* hash layer (stadio e): [vocab, topk], -1 = slot vuoto */
     QT c_kv, c_gate; float *c_ln, *c_pb;           /* HCA compressor (stadio c): proiezioni + norm + position_bias [rate,hd] */
+    /* CSA (stadio d): compressor Ca/Cb a 2*hd + lightning indexer a index_hd */
+    QT x_kv, x_gate, x_qb; float *x_ln, *x_pb, *x_wp;   /* indexer: proiezioni, norm, pos_bias [rate,2*ihd], weights_proj [NH,D] */
     float *hc_attn_fn, *hc_attn_base, *hc_attn_scale;   /* [(2+hc)*hc, hc*D], [(2+hc)*hc], [3] */
     float *hc_ffn_fn,  *hc_ffn_base,  *hc_ffn_scale;
 #ifdef COLI_CUDA
@@ -187,6 +190,8 @@ typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
 typedef struct {
     float **Lc, **Rc, **Ic;
     float **Cc, **ccK, **ccG; int *cc_len;       /* DSv4 HCA: righe compresse + ring finestra corrente */
+    float **ccK2, **ccG2;                        /* DSv4 CSA: ring 2*rate token di kv2/gate2 [2*rate, 2*hd] */
+    float **Xc, **xcK2, **xcG2;                  /* CSA indexer: righe compresse [max_t/rate, ihd] + ring [2*rate, 2*ihd] */
     int *kv_start, max_t;
     int disk_nrec;
     char disk_path[2048];
@@ -1062,19 +1067,26 @@ static void load_cfg(Cfg *c, const char *snap){
             for(int i=0;i<c->n_layers && i<128;i++){
                 const char *t=(lt&&lt->t==J_ARR&&i<lt->len&&lt->kids[i]->t==J_STR)?lt->kids[i]->str:NULL;
                 if(t && !strcmp(t,"heavily_compressed_attention")){ c->hca[i]=1; nhca++; }
+                else if(t && !strcmp(t,"compressed_sparse_attention")){ c->csa[i]=1; }
                 else if(t && strcmp(t,"sliding_attention")){
-                    fprintf(stderr,"config: deepseek_v4 layer_types[%d]='%s' not supported yet "
-                                   "(V4_DESIGN stadi b+c: sliding|HCA; CSA/indexer pending)\n",i,t);
+                    fprintf(stderr,"config: deepseek_v4 layer_types[%d]='%s' unsupported\n",i,t);
                     exit(1); }
                 c->swa[i]=c->sliding;
             }
-            if(nhca){
-                jval *cr=json_get(r,"compress_rates");
+            { jval *cr=json_get(r,"compress_rates");
+              int ncsa=0; for(int i=0;i<c->n_layers&&i<128;i++) ncsa+=c->csa[i];
+              if(nhca){
                 jval *hr=cr?json_get(cr,"heavily_compressed_attention"):NULL;
                 c->hca_rate=hr?(int)hr->num:128;
                 if(c->hca_rate<2||c->hca_rate>4096){ fprintf(stderr,"config: hca compress rate %d out of range\n",c->hca_rate); exit(1); }
                 fprintf(stderr,"[V4] HCA on %d layer(s): 1 compressed KV row per %d tokens\n",nhca,c->hca_rate);
-            } }
+              }
+              if(ncsa){
+                jval *sr=cr?json_get(cr,"compressed_sparse_attention"):NULL;
+                c->csa_rate=sr?(int)sr->num:4;
+                if(c->csa_rate<2||c->csa_rate>4096){ fprintf(stderr,"config: csa compress rate %d out of range\n",c->csa_rate); exit(1); }
+                /* index_* si valida dopo il parse dei campi indexer (piu' sotto) */
+              } } }
           { jval *ml=json_get(r,"mlp_layer_types");
             int nhash=0;
             if(ml&&ml->t==J_ARR) for(int i=0;i<ml->len && i<128;i++){
@@ -1243,6 +1255,13 @@ static void load_cfg(Cfg *c, const char *snap){
       } }
     /* DSA lightning indexer: parametri + tipo per-layer (lista esplicita o formula freq/offset) */
     c->index_topk=gi(r,"index_topk"); c->index_nh=gi(r,"index_n_heads"); c->index_hd=gi(r,"index_head_dim");
+    if(c->v4 && c->csa_rate>0){
+        if(c->index_nh<1||c->index_nh>64||c->index_hd<1||c->index_hd>256||c->index_topk<1){
+            fprintf(stderr,"config: CSA needs index_n_heads(<=64)/index_head_dim(<=256)/index_topk\n"); exit(1); }
+        int ncsa=0; for(int i=0;i<c->n_layers&&i<128;i++) ncsa+=c->csa[i];
+        fprintf(stderr,"[V4] CSA on %d layer(s): rate %d, lightning indexer top-%d (%d heads x %d)\n",
+                ncsa,c->csa_rate,c->index_topk,c->index_nh,c->index_hd);
+    }
     { jval *it=json_get(r,"indexer_types");
       int freq=gi(r,"index_topk_freq"); if(freq<1) freq=1;
       jval *of=json_get(r,"index_skip_topk_offset"); int off=of?(int)of->num:2;
@@ -1510,6 +1529,19 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
                 l->c_gate= qt_load(m,P("self_attn.compressor.gate_proj.weight"), c->head_dim, D, dbits);
                 l->c_ln  = ld(m,P("self_attn.compressor.kv_norm.weight"));
                 l->c_pb  = ld(m,P("self_attn.compressor.position_bias"));
+            }
+            if(i<128 && c->csa[i]){
+                /* CSA (stadio d): compressor a 2*hd (serie Ca/Cb) + indexer */
+                l->c_kv  = qt_load(m,P("self_attn.compressor.kv_proj.weight"),   2*c->head_dim, D, dbits);
+                l->c_gate= qt_load(m,P("self_attn.compressor.gate_proj.weight"), 2*c->head_dim, D, dbits);
+                l->c_ln  = ld(m,P("self_attn.compressor.kv_norm.weight"));
+                l->c_pb  = ld(m,P("self_attn.compressor.position_bias"));
+                l->x_kv  = qt_load(m,P("self_attn.compressor.indexer.kv_proj.weight"),   2*c->index_hd, D, dbits);
+                l->x_gate= qt_load(m,P("self_attn.compressor.indexer.gate_proj.weight"), 2*c->index_hd, D, dbits);
+                l->x_ln  = ld(m,P("self_attn.compressor.indexer.kv_norm.weight"));
+                l->x_pb  = ld(m,P("self_attn.compressor.indexer.position_bias"));
+                l->x_qb  = qt_load(m,P("self_attn.compressor.indexer.q_b_proj.weight"), c->index_nh*c->index_hd, c->q_lora, dbits);
+                l->x_wp  = ld(m,P("self_attn.compressor.indexer.scorer.weights_proj.weight"));
             }
             l->hc_attn_fn   = ld(m,P("attn_hc.fn"));
             l->hc_attn_base = ld(m,P("attn_hc.base"));
@@ -2962,12 +2994,119 @@ static void v4_hca_update(Model *m, Layer *l, int layer, const float *x, int S, 
     }
     free(kv); free(gt);
 }
+/* CSA (stadio d): compressor a doppia serie Ca/Cb. Ogni token emette
+ * kv2/gate2 [2*hd]; la riga compressa w e' la softmax su 2*rate slot:
+ * Ca della finestra w-1 (meta' bassa) + Cb della finestra w (meta' alta),
+ * position_bias per indice-in-finestra sommato all'inserimento. Il ring
+ * ccK2/ccG2 tiene le ultime 2 finestre (slot = pos % 2*rate). L'indexer ha
+ * il suo compressor identico a index_hd (xcK2/xcG2 -> Xc). Righe emesse:
+ * norm + rope parziale a posizione w*rate con theta_comp — come HCA. */
+static void v4_csa_emit(const Cfg *c, float *dstC, const float *ringK, const float *ringG,
+                        int w, int rate, int hd2, int hd, const float *lnw, int rd, float th){
+    float eps=c->eps;
+    /* softmax per-dimensione su 2*rate candidati: (prev Ca)[j] e (curr Cb)[j] */
+    float tmp[512];
+    for(int j=0;j<hd;j++){
+        float mx=-1e30f;
+        for(int r=0;r<2*rate;r++){
+            int is_prev=r<rate;
+            int pos=is_prev?((w-1)*rate+r):(w*rate+(r-rate));
+            if(pos<0) continue;
+            int slot=pos%(2*rate);
+            float g=ringG[(int64_t)slot*hd2 + (is_prev?j:hd+j)];
+            if(g>mx) mx=g;
+        }
+        float sum=0, acc=0;
+        for(int r=0;r<2*rate;r++){
+            int is_prev=r<rate;
+            int pos=is_prev?((w-1)*rate+r):(w*rate+(r-rate));
+            if(pos<0) continue;
+            int slot=pos%(2*rate);
+            float g=ringG[(int64_t)slot*hd2 + (is_prev?j:hd+j)];
+            float k=ringK[(int64_t)slot*hd2 + (is_prev?j:hd+j)];
+            float e=expf(g-mx); sum+=e; acc+=e*k;
+        }
+        tmp[j]=acc/(sum+1e-20f);
+    }
+    float nrm[512];
+    rmsnorm(nrm,tmp,lnw,hd,eps);
+    rope_v4(nrm,w*rate,hd,rd,th,1.f);
+    memcpy(dstC,nrm,(size_t)hd*sizeof(float));
+}
+static void v4_csa_update(Model *m, Layer *l, int layer, const float *x, int S, int pos_base,
+                          KVState *ks){
+    Cfg *c=&m->c; int hd=c->head_dim, ihd=c->index_hd, rate=c->csa_rate, rd=c->rope_hd;
+    float *kv=falloc((int64_t)S*2*hd), *gt=falloc((int64_t)S*2*hd);
+    float *xkv=falloc((int64_t)S*2*ihd), *xgt=falloc((int64_t)S*2*ihd);
+    matmul_qt_ex(kv,(float*)x,&l->c_kv,S,0);  matmul_qt_ex(gt,(float*)x,&l->c_gate,S,0);
+    matmul_qt_ex(xkv,(float*)x,&l->x_kv,S,0); matmul_qt_ex(xgt,(float*)x,&l->x_gate,S,0);
+    for(int s=0;s<S;s++){
+        int pos=pos_base+s, r=pos%rate, slot=pos%(2*rate);
+        memcpy(ks->ccK2[layer]+(int64_t)slot*2*hd, kv+(int64_t)s*2*hd, (size_t)2*hd*sizeof(float));
+        memcpy(ks->xcK2[layer]+(int64_t)slot*2*ihd, xkv+(int64_t)s*2*ihd, (size_t)2*ihd*sizeof(float));
+        { float *gd=ks->ccG2[layer]+(int64_t)slot*2*hd; const float *pb=l->c_pb+(int64_t)r*2*hd;
+          for(int j=0;j<2*hd;j++) gd[j]=gt[(int64_t)s*2*hd+j]+pb[j]; }
+        { float *gd=ks->xcG2[layer]+(int64_t)slot*2*ihd; const float *pb=l->x_pb+(int64_t)r*2*ihd;
+          for(int j=0;j<2*ihd;j++) gd[j]=xgt[(int64_t)s*2*ihd+j]+pb[j]; }
+        if(r==rate-1){
+            int w=pos/rate;
+            v4_csa_emit(c, ks->Cc[layer]+(int64_t)w*hd, ks->ccK2[layer], ks->ccG2[layer],
+                        w,rate,2*hd,hd,l->c_ln,rd,c->theta_comp);
+            v4_csa_emit(c, ks->Xc[layer]+(int64_t)w*ihd, ks->xcK2[layer], ks->xcG2[layer],
+                        w,rate,2*ihd,ihd,l->x_ln,rd,c->theta_comp);
+            ks->cc_len[layer]=w+1;
+        }
+    }
+    free(kv); free(gt); free(xkv); free(xgt);
+}
+/* Lightning indexer (stadio d): seleziona per la query s i top-index_topk
+ * blocchi compressi visibili (w < (pos+1)/rate). Ritorna nsel. */
+static int v4_csa_select(Model *m, Layer *l, int layer, const float *x_row, const float *qr_row,
+                         int pos, KVState *ks, int *sel){
+    Cfg *c=&m->c; int NH=c->index_nh, ihd=c->index_hd, rd=c->rope_hd, rate=c->csa_rate;
+    int vis=(pos+1)/rate; if(vis>ks->cc_len[layer]) vis=ks->cc_len[layer];
+    if(vis<1) return 0;
+    float q[64*256];                            /* NH<=64 CKR, ihd<=256 */
+    matmul_qt_ex(q,(float*)qr_row,&l->x_qb,1,0);
+    for(int h=0;h<NH;h++) rope_v4(q+(int64_t)h*ihd,pos,ihd,rd,c->theta_comp,1.f);
+    float scl=1.f/sqrtf((float)ihd), wscl=1.f/sqrtf((float)NH);
+    float wgt[64];
+    for(int h=0;h<NH;h++){
+        const float *wp=l->x_wp+(int64_t)h*c->hidden;
+        double acc=0; for(int d=0;d<c->hidden;d++) acc+=(double)wp[d]*x_row[d];
+        wgt[h]=(float)acc*wscl;
+    }
+    float sc[4096];                             /* vis <= max_t/rate; CKR index_topk<=1<<20, clamp */
+    if(vis>4096) vis=4096;
+    for(int w=0;w<vis;w++){
+        const float *kt=ks->Xc[layer]+(int64_t)w*ihd;
+        float acc=0;
+        for(int h=0;h<NH;h++){
+            const float *qh=q+(int64_t)h*ihd;
+            float dot=0; for(int j=0;j<ihd;j++) dot+=qh[j]*kt[j];
+            if(dot>0) acc+=dot*scl*wgt[h];
+        }
+        sc[w]=acc;
+    }
+    int k=c->index_topk; if(k>vis) k=vis;
+    int n=0;
+    for(int kk=0;kk<k;kk++){
+        int best=-1; float bv=-1e30f;
+        for(int w=0;w<vis;w++){
+            int taken=0; for(int j=0;j<n;j++) if(sel[j]==w){taken=1;break;}
+            if(!taken && sc[w]>bv){ bv=sc[w]; best=w; }
+        }
+        if(best<0) break;
+        sel[n++]=best;
+    }
+    return n;
+}
 static void attention_v4(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
                          KVState *const *kvs, const int *positions, float *out){
     Cfg *c=&m->c; int H=c->n_heads, hd=c->head_dim, rd=c->rope_hd;
     /* rope per-layer: sliding-only usa theta "main"; i layer HCA/CSA usano il
      * theta "compress" ANCHE per q/kv (rope_layer_type del riferimento). */
-    float th = (layer<128 && c->hca[layer]) ? c->theta_comp : c->theta;
+    float th = (layer<128 && (c->hca[layer]||c->csa[layer])) ? c->theta_comp : c->theta;
     double ta0=now_s();
     float *QR=falloc((int64_t)S*c->q_lora), *Q=falloc((int64_t)S*H*hd), *KV=falloc((int64_t)S*hd);
     matmul_qt_ex(QR,x,&l->q_a,S,0);
@@ -2992,12 +3131,31 @@ static void attention_v4(Model *m, Layer *l, int layer, float *x, int S, int pos
         memcpy(KV+(int64_t)s*hd,tmp,(size_t)hd*sizeof(float));
         memcpy(coli_kv_row(ks->Lc[layer],pos,c->kv_lora),tmp,(size_t)hd*sizeof(float));
     }
-    /* HCA: aggiorna il piano compresso (ragged: per-riga sul proprio KVState) */
+    /* HCA/CSA: aggiorna i piani compressi (ragged: per-riga sul proprio KVState) */
     int is_hca = layer<128 && c->hca[layer] && c->hca_rate>0;
+    int is_csa = layer<128 && c->csa[layer] && c->csa_rate>0;
     if(is_hca){
         if(!kvs) v4_hca_update(m,l,layer,x,S,pos_base,m->kv);
         else for(int s=0;s<S;s++)
             v4_hca_update(m,l,layer,x+(int64_t)s*c->hidden,1,positions[s],kvs[s]);
+    }
+    if(is_csa){
+        if(!kvs) v4_csa_update(m,l,layer,x,S,pos_base,m->kv);
+        else for(int s=0;s<S;s++)
+            v4_csa_update(m,l,layer,x+(int64_t)s*c->hidden,1,positions[s],kvs[s]);
+    }
+    /* CSA: selezione indexer per riga (fuori dal loop OMP: usa QR e x) */
+    int *csa_sel=NULL, *csa_n=NULL;
+    if(is_csa){
+        csa_sel=malloc((size_t)S*c->index_topk*sizeof(int));
+        csa_n=malloc((size_t)S*sizeof(int));
+        for(int s=0;s<S;s++){
+            int pos = positions?positions[s]:pos_base+s;
+            KVState *ks = kvs?kvs[s]:m->kv;
+            csa_n[s]=v4_csa_select(m,l,layer,x+(int64_t)s*c->hidden,
+                                   QR+(int64_t)s*c->q_lora,pos,ks,
+                                   csa_sel+(int64_t)s*c->index_topk);
+        }
     }
     float *ao=falloc((int64_t)S*H*hd);
     int win = layer<128 ? c->swa[layer] : 0;
@@ -3015,13 +3173,15 @@ static void attention_v4(Model *m, Layer *l, int layer, float *x, int S, int pos
             float acc=0; for(int j=0;j<hd;j++) acc+=q[j]*kt[j];
             acc*=c->attn_scale; sc[t-st0]=acc; if(acc>mx) mx=acc;
         }
-        /* HCA: le righe compresse visibili alla query t sono w < (t+1)/rate
-         * (block_bias del riferimento); partecipano alla STESSA softmax. */
-        int ncc = is_hca ? (pos+1)/c->hca_rate : 0;
-        if(ncc>ks->cc_len[layer]) ncc=ks->cc_len[layer];
+        /* HCA: tutte le righe compresse causalmente visibili; CSA: SOLO le
+         * righe scelte dall'indexer per questa query. Stessa softmax col sink. */
+        int ncc=0; const int *wsel=NULL;
+        if(is_hca){ ncc=(pos+1)/c->hca_rate; if(ncc>ks->cc_len[layer]) ncc=ks->cc_len[layer]; }
+        else if(is_csa){ ncc=csa_n[s]; wsel=csa_sel+(int64_t)s*c->index_topk; }
         float *cs = ncc>0 ? malloc((size_t)ncc*sizeof(float)) : NULL;
         for(int w2=0;w2<ncc;w2++){
-            const float *ct=ks->Cc[layer]+(int64_t)w2*hd;
+            int wrow = wsel ? wsel[w2] : w2;
+            const float *ct=ks->Cc[layer]+(int64_t)wrow*hd;
             float acc=0; for(int j=0;j<hd;j++) acc+=q[j]*ct[j];
             acc*=c->attn_scale; cs[w2]=acc; if(acc>mx) mx=acc;
         }
@@ -3037,7 +3197,8 @@ static void attention_v4(Model *m, Layer *l, int layer, float *x, int S, int pos
             for(int j=0;j<hd;j++) dst[j]+=w*vt[j];
         }
         for(int w2=0;w2<ncc;w2++){
-            const float *vt=ks->Cc[layer]+(int64_t)w2*hd;                /* comp K==V */
+            int wrow = wsel ? wsel[w2] : w2;
+            const float *vt=ks->Cc[layer]+(int64_t)wrow*hd;              /* comp K==V */
             float w=cs[w2]*inv;
             for(int j=0;j<hd;j++) dst[j]+=w*vt[j];
         }
@@ -3059,7 +3220,7 @@ static void attention_v4(Model *m, Layer *l, int layer, float *x, int S, int pos
     }
     matmul_qt_ex(out,oa,&l->o_b,S,0);
     m->t_attn+=now_s()-ta0;
-    free(QR); free(Q); free(KV); free(ao); free(oa);
+    free(QR); free(Q); free(KV); free(ao); free(oa); free(csa_sel); free(csa_n);
 }
 
 static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
@@ -5138,15 +5299,36 @@ static void kv_alloc(Model *m, int max_t){
     if(k->Cc){ for(int i=0;i<c->n_layers;i++){ free(k->Cc[i]); free(k->ccK[i]); free(k->ccG[i]); }
                free(k->Cc); free(k->ccK); free(k->ccG); free(k->cc_len);
                k->Cc=NULL; k->ccK=NULL; k->ccG=NULL; k->cc_len=NULL; }
-    if(c->v4 && c->hca_rate>0){
+    if(k->ccK2){ for(int i=0;i<c->n_layers;i++){ free(k->ccK2[i]); free(k->ccG2[i]);
+                   free(k->Xc[i]); free(k->xcK2[i]); free(k->xcG2[i]); }
+                 free(k->ccK2); free(k->ccG2); free(k->Xc); free(k->xcK2); free(k->xcG2);
+                 k->ccK2=NULL; k->ccG2=NULL; k->Xc=NULL; k->xcK2=NULL; k->xcG2=NULL; }
+    if(c->v4 && (c->hca_rate>0 || c->csa_rate>0)){
         k->Cc=calloc(c->n_layers,sizeof(float*));
         k->ccK=calloc(c->n_layers,sizeof(float*)); k->ccG=calloc(c->n_layers,sizeof(float*));
         k->cc_len=calloc(c->n_layers,sizeof(int));
-        int64_t crows=(int64_t)max_t/c->hca_rate+2;
-        for(int i=0;i<c->n_layers;i++) if(i<128 && c->hca[i]){
-            k->Cc[i]=falloc(crows*c->head_dim);
-            k->ccK[i]=falloc((int64_t)c->hca_rate*c->head_dim);
-            k->ccG[i]=falloc((int64_t)c->hca_rate*c->head_dim);
+        k->ccK2=calloc(c->n_layers,sizeof(float*)); k->ccG2=calloc(c->n_layers,sizeof(float*));
+        k->Xc=calloc(c->n_layers,sizeof(float*));
+        k->xcK2=calloc(c->n_layers,sizeof(float*)); k->xcG2=calloc(c->n_layers,sizeof(float*));
+        for(int i=0;i<c->n_layers && i<128;i++){
+            if(c->hca[i]){
+                int64_t crows=(int64_t)max_t/c->hca_rate+2;
+                k->Cc[i]=falloc(crows*c->head_dim);
+                k->ccK[i]=falloc((int64_t)c->hca_rate*c->head_dim);
+                k->ccG[i]=falloc((int64_t)c->hca_rate*c->head_dim);
+            }
+            if(c->csa[i]){
+                int64_t crows=(int64_t)max_t/c->csa_rate+2;
+                k->Cc[i]=falloc(crows*c->head_dim);
+                /* ring 2 finestre (Ca del w-1 + Cb del w corrente) a 2*hd / 2*ihd */
+                k->ccK2[i]=falloc((int64_t)2*c->csa_rate*2*c->head_dim);
+                k->ccG2[i]=falloc((int64_t)2*c->csa_rate*2*c->head_dim);
+                k->Xc[i]=falloc(crows*c->index_hd);
+                k->xcK2[i]=falloc((int64_t)2*c->csa_rate*2*c->index_hd);
+                k->xcG2[i]=falloc((int64_t)2*c->csa_rate*2*c->index_hd);
+                for(int64_t z=0;z<(int64_t)2*c->csa_rate*2*c->head_dim;z++) k->ccG2[i][z]=-1e30f;
+                for(int64_t z=0;z<(int64_t)2*c->csa_rate*2*c->index_hd;z++) k->xcG2[i][z]=-1e30f;
+            }
         }
     }
     k->max_t=max_t;
