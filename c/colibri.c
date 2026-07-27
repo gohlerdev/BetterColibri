@@ -83,6 +83,7 @@ typedef struct {
     int hidden, n_layers, n_heads, n_experts, topk, moe_inter, dense_inter;
     int first_dense, q_lora, kv_lora, qk_nope, qk_rope, qk_head, v_head, n_shared, vocab;
     int n_group, topk_group, norm_topk;
+    int score_func;                              /* 0=sigmoid (GLM/DSv3), 1=softmax (Qwen3), 2=sqrtsoftplus (DSv4) */
     int stop_ids[8], n_stop;                     /* eos_token_id dal config (GLM-5.2 ne ha 3!) */
     int index_topk, index_nh, index_hd;          /* DSA lightning indexer */
     int8_t idx_type[128];                        /* per layer: 1=full (calcola), 0=shared (riusa) */
@@ -601,6 +602,22 @@ static float g_route_p=0;    /* ROUTE_P: if >0, choose M from cumulative router 
 static float g_route_alpha=1.f; /* ROUTE_ALPHA: scale gate mass of CACHE_ROUTE substitutes before renorm (1=off) */
 static int g_route_agree=0;  /* ROUTE_AGREE=1: footer overlap% + mean KL vs true top-K */
 static int expert_is_resident(Model *m, int layer, int eid); /* pin∪LRU; defined near pilot */
+static void softmax(float *x,int n);                          /* defined with the math helpers below */
+static inline float sigmoidf(float x);
+/* Router scoring (multi-model): transform raw router logits into gate scores
+ * in place. 0=sigmoid (GLM-5.2 / DeepSeek-V3 / Kimi-K2), 1=softmax (Qwen3
+ * class), 2=sqrtsoftplus = sqrt(log(1+e^x)) (DeepSeek-V4; reference Gate:
+ * F.softplus(scores).sqrt()). softplus uses the standard stable form
+ * max(x,0)+log1p(e^-|x|) so large logits cannot overflow expf. */
+static inline float softplusf(float x){
+    float ax = x<0 ? -x : x;
+    return (x>0?x:0.f) + log1pf(expf(-ax));
+}
+static void route_score(float *logit, int E, int score_func){
+    if(score_func==1){ softmax(logit,E); return; }
+    if(score_func==2){ for(int e=0;e<E;e++) logit[e]=sqrtf(softplusf(logit[e])); return; }
+    for(int e=0;e<E;e++) logit[e]=sigmoidf(logit[e]);
+}
 /* DeepSeek-V3 group-limited routing (noaux_tc with n_group>1): the E experts are
  * split into n_group equal groups; a group's score is the SUM OF ITS TOP-2 member
  * choice scores (bias-included — reference: DeepseekV3TopkRouter.get_topk_indices,
@@ -908,6 +925,19 @@ static void load_cfg(Cfg *c, const char *snap){
     c->v_head=gi(r,"v_head_dim"); c->n_shared=gi(r,"n_shared_experts"); c->vocab=gi(r,"vocab_size");
     c->n_group=gi(r,"n_group"); c->topk_group=gi(r,"topk_group");
     jval *nt=json_get(r,"norm_topk_prob"); c->norm_topk=(nt&&nt->t==J_BOOL)?nt->boolean:0;
+    /* Router scoring function (multi-model): GLM/DeepSeek ship "sigmoid",
+     * DeepSeek-V4 "sqrtsoftplus", Qwen3-class configs omit it (softmax
+     * semantics) but ALSO omit n_routed_experts — absent field defaults to
+     * sigmoid so every currently-loadable model keeps its exact old path. */
+    { jval *sf=json_get(r,"scoring_func");
+      c->score_func=0;
+      if(sf && sf->t==J_STR && sf->str){
+          if(!strcmp(sf->str,"softmax")) c->score_func=1;
+          else if(!strcmp(sf->str,"sqrtsoftplus")) c->score_func=2;
+          else if(strcmp(sf->str,"sigmoid")){
+              fprintf(stderr,"config: unknown scoring_func '%s' (sigmoid|softmax|sqrtsoftplus)\n",sf->str);
+              exit(1); }
+      } }
     jval *ep=json_get(r,"rms_norm_eps"); c->eps=ep?(float)ep->num:1e-5f;
     jval *rs=json_get(r,"routed_scaling_factor"); c->routed_scale=rs?(float)rs->num:1.f;
     jval *rp=json_get(r,"rope_parameters"); jval *th=rp?json_get(rp,"rope_theta"):NULL;
@@ -2884,7 +2914,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     if(!pre_routed)
     for(int s=0;s<S;s++){
         float *logit=logits_all+(int64_t)s*E;
-        for(int e=0;e<E;e++){ logit[e]=sigmoidf(logit[e]); choice[e]=logit[e]+l->router_bias[e]; }
+        route_score(logit,E,c->score_func);          /* sigmoid/softmax/sqrtsoftplus */
+        for(int e=0;e<E;e++) choice[e]=logit[e]+l->router_bias[e];
         route_group_mask(choice,E,c->n_group,c->topk_group);   /* DSv3: no-op when n_group==1 */
         int *idx=idxs+(int64_t)s*K; float *w=ws+(int64_t)s*K;
         int Ksel = g_topk>0 ? (g_topk<K?g_topk:K) : K;
@@ -3971,7 +4002,8 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
             rmsnorm(nrm, xs, l->post_ln, D, c->eps);
         }
         matmul(ch, nrm, l->router, 1, D, E);
-        for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
+        route_score(ch,E,c->score_func);
+        for(int e=0;e<E;e++) ch[e]+=l->router_bias[e];
         route_group_mask(ch,E,c->n_group,c->topk_group);   /* prediction parity with FASE A */
         for(int kk=0;kk<K;kk++){
             int best=0; for(int e=1;e<E;e++) if(ch[e]>ch[best]) best=e;

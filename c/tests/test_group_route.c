@@ -53,7 +53,9 @@ static void ref_group_keep(const float *choice, int E, int n_group, int topk_gro
 
 /* per-expert top-k on scores (first-index tie-break), shared shape with FASE A */
 static void topk_select(const float *sc, int E, int K, int *idx){
-    unsigned char used[4096]; memset(used,0,(size_t)E);
+    unsigned char used[4096];
+    if(E<1 || E>4096) return;                 /* also silences -Wstringop-overflow */
+    memset(used,0,(size_t)E);
     for(int kk=0;kk<K;kk++){ int best=-1; float bv=-1e30f;
         for(int e=0;e<E;e++) if(!used[e] && sc[e]>bv){ bv=sc[e]; best=e; }
         idx[kk]=best; if(best>=0) used[best]=1; }
@@ -129,6 +131,33 @@ int main(void){
           }
       }
       cases++; }
+    /* 6) route_score arms vs independent reference math (multi-model routers).
+     * sigmoid: 1/(1+e^-x); softmax: e^xi/sum (stable); sqrtsoftplus (DSv4):
+     * sqrt(log(1+e^x)) — double-precision reference, 1e-6 rel tolerance. */
+    { int E=64; float x0[64], sc[64];
+      for(int e=0;e<E;e++) x0[e]=frand()*8.f;       /* wide range incl. |x|>6 */
+      x0[0]=88.f; x0[1]=-88.f;                       /* stability extremes */
+      /* sigmoid */
+      memcpy(sc,x0,sizeof(sc)); route_score(sc,E,0);
+      for(int e=0;e<E;e++){ double r=1.0/(1.0+exp(-(double)x0[e]));
+          if(fabs(sc[e]-r) > 1e-6*(1.0+fabs(r))) FAIL("sigmoid[%d]: %g vs %g",e,sc[e],r); }
+      /* softmax */
+      memcpy(sc,x0,sizeof(sc)); route_score(sc,E,1);
+      { double mx=-1e30,sm=0; for(int e=0;e<E;e++) if(x0[e]>mx) mx=x0[e];
+        for(int e=0;e<E;e++) sm+=exp((double)x0[e]-mx);
+        double tot=0;
+        for(int e=0;e<E;e++){ double r=exp((double)x0[e]-mx)/sm; tot+=sc[e];
+            if(fabs(sc[e]-r) > 1e-5*(1.0+fabs(r))) FAIL("softmax[%d]: %g vs %g",e,sc[e],r); }
+        if(fabs(tot-1.0)>1e-4) FAIL("softmax sum %g != 1",tot); }
+      /* sqrtsoftplus */
+      memcpy(sc,x0,sizeof(sc)); route_score(sc,E,2);
+      for(int e=0;e<E;e++){ double sp=log1p(exp(-fabs((double)x0[e])))+(x0[e]>0?(double)x0[e]:0.0);
+          double r=sqrt(sp);
+          if(fabs(sc[e]-r) > 1e-5*(1.0+fabs(r))) FAIL("sqrtsoftplus[%d] x=%g: %g vs %g",e,x0[e],sc[e],r); }
+      /* stability: no NaN/Inf anywhere */
+      for(int f=0;f<3;f++){ memcpy(sc,x0,sizeof(sc)); route_score(sc,E,f);
+          for(int e=0;e<E;e++) if(!isfinite(sc[e])) FAIL("score_func=%d[%d] not finite",f,e); }
+      cases+=3; }
     printf("test_group_route: %d cases run, %d failure(s)\n", cases, g_fail);
     if(g_fail) return 1;
     puts("test_group_route: ok");
