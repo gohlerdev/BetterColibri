@@ -210,5 +210,9 @@ per-head q-RMS, partial rope in V4's ADJACENT-PAIR rotate_half variant —
 caught by L0 pinning, 0.28 → 9.3e-8 — inverse output rope, sinks, grouped-O)
 plus swiglu-clamped experts. TF 32/32 f32 / greedy 20/20 / int8 32/32 on the
 tiny all-sliding V4; CSA/HCA configs are refused loudly at load as designed.
-Remaining stages: (c) HCA compressor plane, (d) CSA + indexer, (e) hash FASE A
-wiring, (f) DSpark. The engine now validates SIX architectures end-to-end.
+Stage (e) also landed the same night (f73dc37): hash layers route by the
+tid2eid[token] table end-to-end (st.h I64 reader, FASE A hash branch, token
+ids published by all four forward drivers), TF 32/32 with a live hash layer
+and a seeded non-trivial table. Remaining stages: (c) HCA compressor plane,
+(d) CSA + indexer, (f) DSpark. The engine now validates SIX architectures
+end-to-end.
