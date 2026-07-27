@@ -601,6 +601,36 @@ static float g_route_p=0;    /* ROUTE_P: if >0, choose M from cumulative router 
 static float g_route_alpha=1.f; /* ROUTE_ALPHA: scale gate mass of CACHE_ROUTE substitutes before renorm (1=off) */
 static int g_route_agree=0;  /* ROUTE_AGREE=1: footer overlap% + mean KL vs true top-K */
 static int expert_is_resident(Model *m, int layer, int eid); /* pin∪LRU; defined near pilot */
+/* DeepSeek-V3 group-limited routing (noaux_tc with n_group>1): the E experts are
+ * split into n_group equal groups; a group's score is the SUM OF ITS TOP-2 member
+ * choice scores (bias-included — reference: DeepseekV3TopkRouter.get_topk_indices,
+ * group_scores = topk(2).sum). Only the top `topk_group` groups stay eligible;
+ * the rest are masked to -inf in choice[] so the existing per-expert top-k
+ * selection below never picks them. Gate WEIGHTS still come from the unmasked
+ * sigmoid logit[], exactly like the bias: selection-only. n_group==1 -> no-op
+ * (GLM path byte-identical). */
+static void route_group_mask(float *choice, int E, int n_group, int topk_group){
+    if(n_group<=1 || topk_group>=n_group) return;
+    int gsz=E/n_group;
+    float gs[256];                                   /* n_group <= 256 (CKR) */
+    for(int g=0;g<n_group;g++){
+        float m1=-1e30f, m2=-1e30f;                  /* top-2 member scores */
+        const float *cg=choice+(int64_t)g*gsz;
+        for(int i=0;i<gsz;i++){ float v=cg[i];
+            if(v>m1){ m2=m1; m1=v; } else if(v>m2) m2=v; }
+        gs[g]=m1+(gsz>1?m2:0.f);
+    }
+    /* keep the topk_group best groups (ties: lower group index wins, matching
+     * torch.topk's first-occurrence tie behavior on equal values) */
+    unsigned char keep[256]; memset(keep,0,(size_t)n_group);
+    for(int r=0;r<topk_group;r++){ int best=-1; float bv=-1e30f;
+        for(int g=0;g<n_group;g++) if(!keep[g] && gs[g]>bv){ bv=gs[g]; best=g; }
+        if(best<0) break; keep[best]=1; }
+    for(int g=0;g<n_group;g++) if(!keep[g]){
+        float *cg=choice+(int64_t)g*gsz;
+        for(int i=0;i<gsz;i++) cg[i]=-1e30f;
+    }
+}
 static int g_spec=1;     /* metodo C: SPEC=0 disabilita il prefetch speculativo cross-layer */
 static int g_draft=0;    /* metodo E: DRAFT=n token auto-speculati per forward via n-gram lookup
                           * (0=off). LOSSLESS: verifica = output identico al greedy. Default OFF:
@@ -931,7 +961,23 @@ static void load_cfg(Cfg *c, const char *snap){
       } }
     c->qk_head=c->qk_nope+c->qk_rope;
     c->attn_scale = 1.f / sqrtf((float)c->qk_head);
-    if(c->n_group!=1){ fprintf(stderr,"this engine requires n_group=1 (GLM-5.2)\n"); exit(1); }
+    /* DeepSeek-V3 group-limited routing (n_group>1, topk_group groups kept) is
+     * supported since the multi-model work: validate the shape instead of
+     * refusing. GLM-5.2 ships n_group=1 and keeps its exact old path. */
+    if(c->n_group<1) c->n_group=1;
+    if(c->topk_group<1) c->topk_group=c->n_group;
+    if(c->n_group>1){
+        if(c->n_experts % c->n_group){
+            fprintf(stderr,"config: n_routed_experts=%d not divisible by n_group=%d\n",
+                    c->n_experts,c->n_group); exit(1); }
+        if(c->topk_group>c->n_group) c->topk_group=c->n_group;
+        int gsz=c->n_experts/c->n_group;
+        if(c->topk > c->topk_group*gsz){
+            fprintf(stderr,"config: num_experts_per_tok=%d cannot fit in topk_group=%d groups of %d\n",
+                    c->topk,c->topk_group,gsz); exit(1); }
+        fprintf(stderr,"[ROUTER] group-limited: %d groups of %d, keep %d (DeepSeek-V3 style)\n",
+                c->n_group,gsz,c->topk_group);
+    }
     /* VALIDAZIONE (report PR #25): il config.json arriva da mirror non fidati — dimensioni
      * ostili non devono superare questo punto. Un solo choke point protegge ogni alloc a valle. */
     #define CKR(name,v,lo,hi) if((v)<(lo)||(v)>(hi)){ \
@@ -939,6 +985,7 @@ static void load_cfg(Cfg *c, const char *snap){
     CKR("hidden_size",c->hidden,1,1<<20)         CKR("num_hidden_layers",c->n_layers,1,128)
     CKR("num_attention_heads",c->n_heads,1,1024) CKR("n_routed_experts",c->n_experts,1,4096)
     CKR("num_experts_per_tok",c->topk,1,64)      CKR("moe_intermediate_size",c->moe_inter,1,1<<20)
+    CKR("n_group",c->n_group,1,256)              CKR("topk_group",c->topk_group,1,256)
     CKR("intermediate_size",c->dense_inter,1,1<<24) CKR("first_k_dense_replace",c->first_dense,0,c->n_layers)
     CKR("q_lora_rank",c->q_lora,0,1<<20)         CKR("kv_lora_rank",c->kv_lora,1,1<<20)
     CKR("qk_nope_head_dim",c->qk_nope,1,1<<16)   CKR("qk_rope_head_dim",c->qk_rope,1,1<<16)
@@ -2838,6 +2885,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     for(int s=0;s<S;s++){
         float *logit=logits_all+(int64_t)s*E;
         for(int e=0;e<E;e++){ logit[e]=sigmoidf(logit[e]); choice[e]=logit[e]+l->router_bias[e]; }
+        route_group_mask(choice,E,c->n_group,c->topk_group);   /* DSv3: no-op when n_group==1 */
         int *idx=idxs+(int64_t)s*K; float *w=ws+(int64_t)s*K;
         int Ksel = g_topk>0 ? (g_topk<K?g_topk:K) : K;
         if(do_cache_route){
@@ -3924,6 +3972,7 @@ static void pilot_prefetch(Model *m, int lnext, const float *x, int S){
         }
         matmul(ch, nrm, l->router, 1, D, E);
         for(int e=0;e<E;e++) ch[e]=sigmoidf(ch[e])+l->router_bias[e];
+        route_group_mask(ch,E,c->n_group,c->topk_group);   /* prediction parity with FASE A */
         for(int kk=0;kk<K;kk++){
             int best=0; for(int e=1;e<E;e++) if(ch[e]>ch[best]) best=e;
             ch[best]=-2e30f;
