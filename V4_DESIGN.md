@@ -198,3 +198,17 @@ container work.
 - No router work beyond hash wiring (sqrtsoftplus arm landed + tested).
 - No new quant kernel (fmt=7 landed; GPU kernels are the existing deferred
   bucket).
+
+
+## Status update (same night, 19:10 UTC)
+
+transformers 5.14.1 turned out to ship `DeepseekV4ForCausalLM`, which made the
+full TF-oracle ladder possible immediately instead of reference-only. Stage
+(a)+(b) LANDED (ce7167f): mHC hyper-connections (exact 20-iter Sinkhorn) and
+the complete sliding-mode attention (MQA K==V single-row cache, weightless
+per-head q-RMS, partial rope in V4's ADJACENT-PAIR rotate_half variant —
+caught by L0 pinning, 0.28 → 9.3e-8 — inverse output rope, sinks, grouped-O)
+plus swiglu-clamped experts. TF 32/32 f32 / greedy 20/20 / int8 32/32 on the
+tiny all-sliding V4; CSA/HCA configs are refused loudly at load as designed.
+Remaining stages: (c) HCA compressor plane, (d) CSA + indexer, (e) hash FASE A
+wiring, (f) DSpark. The engine now validates SIX architectures end-to-end.
