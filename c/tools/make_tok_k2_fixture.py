@@ -81,8 +81,8 @@ def main():
                 f.write(base64.b64encode(tok) + b" " + str(rank).encode() + b"\n")
         cfgp = os.path.join(td, "config.json")
         json.dump({"added_tokens_decoder": {
-            str(nbase):     {"content": "<|k2_end|>"},
-            str(nbase + 1): {"content": "[K2EOS]"},
+            str(nbase):     {"content": "<|im_end|>"},
+            str(nbase + 1): {"content": "[EOS]"},
         }}, open(cfgp, "w"))
         out = os.path.join(C, "tests", "tok_k2_tiny.json")
         subprocess.run([sys.executable,
@@ -100,7 +100,7 @@ def main():
         r"""\s+(?!\S)""",
         r"""\s+""",
     ])
-    specials = {"<|k2_end|>": nbase, "[K2EOS]": nbase + 1}
+    specials = {"<|im_end|>": nbase, "[EOS]": nbase + 1}
     for i in range(2, 256):
         specials[f"<|reserved_token_{nbase + i}|>"] = nbase + i
     enc = tiktoken.Encoding(name="k2tiny", pat_str=pat,
@@ -114,7 +114,7 @@ def main():
         "1", "123", "1234", "12345", "v1.2.3", "版本12345号",
         "foo/bar", "a//b", "...", "#!/bin/sh", "end.\n", "-->\n\nnext",
         "  x", "x  ", "a  b", "\t\tz", "\n\n  foo\n", "a\r\nb", "   ",
-        "<|k2_end|>test[K2EOS]", "a<|k2_end|>b", "你好<|k2_end|>世界",
+        "<|im_end|>test[EOS]", "a<|im_end|>b", "你好<|im_end|>世界",
         "αβγ ΑΒΓ", "привет", "한국어", "ひらがなカタカナ", "café naïve",
         "e\u0301clair", "🙂ok", "€100", "print('x')\n\treturn",
         "mixedText123你好'sEnd",
