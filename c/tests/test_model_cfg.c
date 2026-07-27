@@ -119,6 +119,62 @@ int main(void){
       CHECK("V4ish","topk",c.topk,6);
       CHECK("V4ish","moe_inter",c.moe_inter,3072); }
 
+    /* ---- Qwen3-235B-A22B (Qwen/Qwen3-235B-A22B, real dims): the GQA family.
+     * Field map diverges: num_experts, head_dim, no q/kv_lora, no shared, no
+     * dense layers; the engine reuses kv_lora/qk_rope as the K/V cache rows. */
+    write_cfg(dir,
+      "{\"model_type\":\"qwen3_moe\",\"hidden_size\":4096,\"num_hidden_layers\":94,"
+      "\"num_attention_heads\":64,\"num_key_value_heads\":4,\"head_dim\":128,"
+      "\"num_experts\":128,\"num_experts_per_tok\":8,\"moe_intermediate_size\":1536,"
+      "\"intermediate_size\":12288,\"norm_topk_prob\":true,\"vocab_size\":151936,"
+      "\"rms_norm_eps\":1e-6,\"rope_parameters\":{\"rope_type\":\"default\",\"rope_theta\":1000000.0},"
+      "\"eos_token_id\":151645}");
+    { Cfg c; load_cfg(&c,dir);
+      CHECK("Qwen3","gqa",c.gqa,1);
+      CHECK("Qwen3","oss",c.oss,0);
+      CHECK("Qwen3","n_kv_heads",c.n_kv_heads,4);
+      CHECK("Qwen3","head_dim",c.head_dim,128);
+      CHECK("Qwen3","n_experts",c.n_experts,128);
+      CHECK("Qwen3","first_dense",c.first_dense,0);
+      CHECK("Qwen3","n_shared",c.n_shared,0);
+      CHECK("Qwen3","score_func",c.score_func,1);
+      CHECK("Qwen3","kv_lora (K row)",c.kv_lora,4*128);
+      CHECK("Qwen3","qk_rope (V row)",c.qk_rope,4*128);
+      CHECK("Qwen3","norm_topk",c.norm_topk,1);
+      /* default rope: inv[0]=1, mscale=1 */
+      if(c.gqa_inv[0]!=1.f || c.gqa_mscale!=1.f)
+          FAIL("Qwen3 rope table: inv0=%g mscale=%g",c.gqa_inv[0],c.gqa_mscale); }
+
+    /* ---- GPT-OSS-120B (openai/gpt-oss-120b, real dims): GQA + sinks/sliding/yarn.
+     * Experts use intermediate_size; router is topk-then-softmax (score_func=3). */
+    write_cfg(dir,
+      "{\"model_type\":\"gpt_oss\",\"hidden_size\":2880,\"num_hidden_layers\":36,"
+      "\"num_attention_heads\":64,\"num_key_value_heads\":8,\"head_dim\":64,"
+      "\"num_local_experts\":128,\"num_experts_per_tok\":4,"
+      "\"intermediate_size\":2880,\"sliding_window\":128,"
+      "\"layer_types\":[\"sliding_attention\",\"full_attention\"],"
+      "\"vocab_size\":201088,\"rms_norm_eps\":1e-5,"
+      "\"rope_parameters\":{\"rope_type\":\"yarn\",\"rope_theta\":150000.0,\"factor\":32.0,"
+      "\"beta_fast\":32.0,\"beta_slow\":1.0,\"truncate\":false,"
+      "\"original_max_position_embeddings\":4096},"
+      "\"eos_token_id\":200002}");
+    { Cfg c; load_cfg(&c,dir);
+      CHECK("OSS","gqa",c.gqa,1);
+      CHECK("OSS","oss",c.oss,1);
+      CHECK("OSS","n_experts",c.n_experts,128);
+      CHECK("OSS","moe_inter=dense_inter",c.moe_inter,2880);
+      CHECK("OSS","score_func",c.score_func,3);
+      CHECK("OSS","swa[0] sliding",c.swa[0],128);
+      CHECK("OSS","swa[1] full",c.swa[1],0);
+      CHECK("OSS","swa[2] parity fallback (even=sliding)",c.swa[2],128);
+      CHECK("OSS","swa[3] parity fallback (odd=full)",c.swa[3],0);
+      /* yarn: mscale = 0.1*ln(32)+1, inv_freq[0]=1/theta^0=1 mixed by ramp */
+      float want_ms=0.1f*logf(32.f)+1.f;
+      if(fabsf(c.gqa_mscale-want_ms)>1e-5f)
+          FAIL("OSS yarn mscale: %g want %g",c.gqa_mscale,want_ms);
+      if(!(c.gqa_inv[0]<=1.f && c.gqa_inv[0]>0.f))
+          FAIL("OSS yarn inv0 out of range: %g",c.gqa_inv[0]); }
+
     /* cleanup */
     { char p[512]; snprintf(p,sizeof(p),"%s/config.json",dir); remove(p); rmdir(dir); }
 
@@ -152,7 +208,7 @@ int main(void){
         for(int o=0;o<8;o++) if(y1[o]!=y2[o]) FAIL("fp4 dispatch o=%d: %g vs %g",o,y1[o],y2[o]); }
       g_fail+=0; }
 
-    printf("test_model_cfg: 4 model shapes, %d failure(s)\n", g_fail);
+    printf("test_model_cfg: 6 model shapes, %d failure(s)\n", g_fail);
     if(g_fail) return 1;
     puts("test_model_cfg: ok");
     return 0;
