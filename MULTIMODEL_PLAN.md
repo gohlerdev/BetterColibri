@@ -127,3 +127,26 @@ Differentiators no one else ships: learned tiering (.coli_usage), router
 lookahead prefetch (71.6% recall), dual-SSD striping, grammar-accelerated
 JSON mode, token-exact oracle validation, and the Brain/Atlas live
 visualization of every expert firing.
+
+---
+
+## Status (2026-07-27, implementation session)
+
+| Item | Commit | State |
+|------|--------|-------|
+| DeepSeek-V3 group-limited routing (n_group/topk_group) | 160dbfa | **done** — route_group_mask in FASE A + PILOT, 2,203-case brute-force-verified, GLM path provably no-op |
+| Multi-model router scoring (sigmoid/softmax/sqrtsoftplus) | 7a33077 | **done** — route_score at both router sites, reference-math-verified incl. ±88 stability |
+| FP4 (e2m1) pack + matmul kernel | 357bc1f | **done** — OCP MX table semantics, AVX2 PSHUFB path, 475-case oracle; engine wiring as fmt=7 awaits the V4 container format |
+| Multi-model config acceptance test | 24e75a8 | **done** — real K2/DSv3/GLM/V4 dims through load_cfg in TEST_BINS; audit: zero hardcoded GLM dims on portable paths (Metal fast-path gates fall back by design) |
+| DSv4 hash-routing groundwork | 269c59b | **done** — num_hash_layers config + hardened tid2eid lookup; FASE A wiring + tokenize-time prefetch land with the container work |
+
+**Engine-side result:** DeepSeek-V3/R1 routing is fully implemented; Kimi K2
+needs no engine changes (confirmed by the acceptance test) — both now wait on
+converter + tokenizer + oracle validation, which need weights and disk.
+V4's router/kernel groundwork is in; CSA/HCA attention + mHC remain the
+V4-Flash design-doc milestone.
+
+**Still needed for end-to-end new-model runs (weights/disk-bound):**
+converter coverage (K2 fp8→int4, V4 fp4 passthrough into fmt=7 slabs +
+tid2eid shipping), K2 tiktoken tokenizer, teacher-forcing oracle validation
+per model — the GLM discipline applied to each.
