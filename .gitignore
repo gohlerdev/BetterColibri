@@ -73,3 +73,5 @@ c/qwen3_tiny/
 c/ref_qwen3.json
 c/gptoss_tiny/
 c/ref_gptoss.json
+c/dsv4_tiny/
+c/ref_dsv4.json
