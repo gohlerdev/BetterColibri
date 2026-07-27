@@ -1185,6 +1185,78 @@ static inline void e8_rot_rows(float *rows, int nr, int dim){
     }
 }
 
+/* ---- FP4 (e2m1) dequant + matmul, fmt=7 (DeepSeek-V4 expert precision) ----
+ * OCP MX-compliant e2m1: 1 sign, 2 exponent, 1 mantissa per nibble. The 8
+ * positive magnitudes are exactly {0, 0.5, 1, 1.5, 2, 3, 4, 6} — a 16-entry
+ * lookup covers the whole format; no bit math in the hot loop. Packing is the
+ * fmt=2 nibble convention (element i in byte i>>1, low nibble first), so all
+ * existing slab/row-bytes arithmetic for int4 applies unchanged. Scales are
+ * per-row f32 like fmt=1/2 (block-scale variants can layer on later exactly
+ * like fmt=4 did for int4). */
+static const float fp4_e2m1_tab[16] = {
+    0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+   -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f };
+static inline float fp4_dec(uint8_t nib){ return fp4_e2m1_tab[nib & 0xF]; }
+
+/* pack f32 row-major weights to e2m1 nibbles + per-row scale (max-abs/6, the
+ * largest representable magnitude). Encoder picks the nearest table value —
+ * ties round to the LARGER magnitude, matching OCP MX round-to-nearest-even
+ * on this value set (all ties land between even mantissa codes). */
+static void pack_fp4(const float *w, uint8_t *q4, float *scale, int O, int I){
+    int rb=(I+1)/2;
+    for(int o=0;o<O;o++){
+        const float *row=w+(int64_t)o*I;
+        float mx=0; for(int i=0;i<I;i++){ float a=fabsf(row[i]); if(a>mx) mx=a; }
+        float sc = mx>0 ? mx/6.0f : 1.0f;          /* 6.0 = e2m1 max magnitude */
+        scale[o]=sc; float inv=1.0f/sc;
+        uint8_t *qr=q4+(int64_t)o*rb;
+        memset(qr,0,(size_t)rb);
+        for(int i=0;i<I;i++){
+            float v=row[i]*inv;
+            uint8_t best=0; float bd=1e30f;
+            for(int c=0;c<16;c++){ float d=fabsf(v-fp4_e2m1_tab[c]);
+                if(d<bd-1e-7f || (d<bd+1e-7f && fabsf(fp4_e2m1_tab[c])>fabsf(fp4_e2m1_tab[best]))){
+                    bd=d; best=(uint8_t)c; } }
+            qr[i>>1] |= (uint8_t)(best << ((i&1)*4));
+        }
+    }
+}
+
+/* y[S,O] = x[S,I] @ W^T, W fp4-e2m1 packed + per-row scale. Table-driven
+ * scalar core; each (o,s) dot is independent (batch-safe like matmul_i4). */
+static void matmul_fp4(float *y, const float *x, const uint8_t *q4, const float *scale,
+                       int S, int I, int O){
+    int rb=(I+1)/2;
+    #pragma omp parallel for schedule(static)
+    for (int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
+        for (int s=0;s<S;s++){ const float *xs=x+(int64_t)s*I; float a=0; int i=0;
+#ifdef __AVX2__
+            /* 16 elems/iter: split nibbles, gather via 2x128-bit PSHUFB table
+             * lookup on the magnitude bits, apply sign from bit 3. */
+            const __m128i m4=_mm_set1_epi8(0x0F);
+            const __m128i tab_lo=_mm_setr_epi8(0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12);
+            __m256 acc=_mm256_setzero_ps();
+            for(;i+16<=I;i+=16){
+                __m128i by=_mm_loadl_epi64((const __m128i*)(w+(i>>1)));
+                __m128i lo=_mm_and_si128(by,m4), hi=_mm_and_si128(_mm_srli_epi16(by,4),m4);
+                __m128i nib=_mm_unpacklo_epi8(lo,hi);          /* elems 0..15, one nibble each */
+                /* halves-of-table trick: values scaled x2 to stay integral in int8,
+                 * compensated by 0.5f in the scale multiply below */
+                __m128i v8=_mm_shuffle_epi8(tab_lo,nib);
+                __m256 w0=_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v8));
+                __m256 w1=_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(v8,8)));
+                acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
+                acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc);
+            }
+            a=hsum256(acc)*0.5f;
+#endif
+            for(;i+1<I;i+=2){ uint8_t b=w[i>>1];
+                a+=xs[i]*fp4_dec(b&0xF)+xs[i+1]*fp4_dec(b>>4); }
+            if(i<I){ uint8_t b=w[i>>1]; a+=xs[i]*fp4_dec(b&0xF); }
+            y[(int64_t)s*O+o]=a*sc;
+        } }
+}
+
 static void matmul_e8(float *y, const float *x, const uint8_t *q, const float *unused,
                       int S, int I, int O){
     (void)unused;                                  /* scales live inside the blocks */
