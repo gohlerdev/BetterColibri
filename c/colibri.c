@@ -84,6 +84,7 @@ typedef struct {
     int first_dense, q_lora, kv_lora, qk_nope, qk_rope, qk_head, v_head, n_shared, vocab;
     int n_group, topk_group, norm_topk;
     int score_func;                              /* 0=sigmoid (GLM/DSv3), 1=softmax (Qwen3), 2=sqrtsoftplus (DSv4) */
+    int n_hash_layers;                           /* DSv4: first N layers route by token-ID table (tid2eid) */
     int stop_ids[8], n_stop;                     /* eos_token_id dal config (GLM-5.2 ne ha 3!) */
     int index_topk, index_nh, index_hd;          /* DSA lightning indexer */
     int8_t idx_type[128];                        /* per layer: 1=full (calcola), 0=shared (riusa) */
@@ -618,6 +619,23 @@ static void route_score(float *logit, int E, int score_func){
     if(score_func==2){ for(int e=0;e<E;e++) logit[e]=sqrtf(softplusf(logit[e])); return; }
     for(int e=0;e<E;e++) logit[e]=sigmoidf(logit[e]);
 }
+/* DSv4 hash routing lookup: expert indices for `token` at a hash layer, from a
+ * row-major tid2eid[vocab, topk] table. Returns the number of valid indices
+ * written (entries out of [0,E) are skipped — a hostile/corrupt table must not
+ * index past the expert arrays; same untrusted-container policy as st.h). */
+static int hash_route_select(const int32_t *tid2eid, int vocab, int topk, int E,
+                             int token, int *idx){
+    if(!tid2eid || token<0 || token>=vocab) return 0;
+    const int32_t *row=tid2eid+(int64_t)token*topk;
+    int n=0;
+    for(int k=0;k<topk;k++){
+        int e=(int)row[k];
+        if(e<0 || e>=E) continue;                 /* refuse OOB, keep the rest */
+        int dup=0; for(int j=0;j<n;j++) if(idx[j]==e){ dup=1; break; }
+        if(!dup) idx[n++]=e;
+    }
+    return n;
+}
 /* DeepSeek-V3 group-limited routing (noaux_tc with n_group>1): the E experts are
  * split into n_group equal groups; a group's score is the SUM OF ITS TOP-2 member
  * choice scores (bias-included — reference: DeepseekV3TopkRouter.get_topk_indices,
@@ -938,6 +956,14 @@ static void load_cfg(Cfg *c, const char *snap){
               fprintf(stderr,"config: unknown scoring_func '%s' (sigmoid|softmax|sqrtsoftplus)\n",sf->str);
               exit(1); }
       } }
+    /* DSv4 hash routing: the first num_hash_layers MoE layers take their expert
+     * INDICES from a per-layer tid2eid[vocab, topk] table keyed by the input
+     * token id (reference Gate: indices = self.tid2eid[input_ids]); gate
+     * WEIGHTS still come from the router scores at those indices. For a
+     * disk-streaming engine this is gold: the expert set of a hash layer is
+     * known the moment the token id is, before any compute. */
+    c->n_hash_layers=gi(r,"num_hash_layers");
+    if(c->n_hash_layers<0) c->n_hash_layers=0;
     jval *ep=json_get(r,"rms_norm_eps"); c->eps=ep?(float)ep->num:1e-5f;
     jval *rs=json_get(r,"routed_scaling_factor"); c->routed_scale=rs?(float)rs->num:1.f;
     jval *rp=json_get(r,"rope_parameters"); jval *th=rp?json_get(rp,"rope_theta"):NULL;

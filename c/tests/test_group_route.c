@@ -158,6 +158,32 @@ int main(void){
       for(int f=0;f<3;f++){ memcpy(sc,x0,sizeof(sc)); route_score(sc,E,f);
           for(int e=0;e<E;e++) if(!isfinite(sc[e])) FAIL("score_func=%d[%d] not finite",f,e); }
       cases+=3; }
+    /* 7) DSv4 hash routing lookup: table-driven selection, OOB refusal, dedup */
+    { int V=16, K=4, E=8;
+      int32_t tab[16*4];
+      for(int t=0;t<V;t++) for(int k=0;k<K;k++) tab[t*K+k]=(int32_t)((t*7+k*3)%E);
+      int idx[8];
+      /* exact table rows come back for every in-range token */
+      for(int t=0;t<V;t++){
+          int n=hash_route_select(tab,V,K,E,t,idx);
+          /* reference: dedup of the raw row, order-preserving */
+          int ref[8], rn=0;
+          for(int k=0;k<K;k++){ int e=(int)tab[t*K+k]; int dup=0;
+              for(int j=0;j<rn;j++) if(ref[j]==e) dup=1;
+              if(!dup) ref[rn++]=e; }
+          if(n!=rn) FAIL("hash tok %d: n=%d ref=%d",t,n,rn);
+          for(int j=0;j<n&&j<rn;j++) if(idx[j]!=ref[j])
+              FAIL("hash tok %d idx[%d]: %d != %d",t,j,idx[j],ref[j]);
+      }
+      /* out-of-range tokens and NULL table select nothing */
+      if(hash_route_select(tab,V,K,E,-1,idx)!=0) FAIL("hash: token -1 selected");
+      if(hash_route_select(tab,V,K,E,V,idx)!=0) FAIL("hash: token V selected");
+      if(hash_route_select(NULL,V,K,E,0,idx)!=0) FAIL("hash: NULL table selected");
+      /* hostile table entries (OOB expert ids) are skipped, valid ones kept */
+      { int32_t bad[4]={-3, 2, 99, 5};
+        int n=hash_route_select(bad,1,4,E,0,idx);
+        if(n!=2 || idx[0]!=2 || idx[1]!=5) FAIL("hash: OOB filter got n=%d",n); }
+      cases+=V+4; }
     printf("test_group_route: %d cases run, %d failure(s)\n", cases, g_fail);
     if(g_fail) return 1;
     puts("test_group_route: ok");
