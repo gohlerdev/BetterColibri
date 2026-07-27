@@ -5832,7 +5832,24 @@ static void run_serve(Model *m, const char *snap){
         const char *tk = getenv("THINK")&&atoi(getenv("THINK"))? "<think>" : "<think></think>";
         if(raw_mode){
             int *tmp=malloc(maxctx*sizeof(int)); if(!tmp){fprintf(stderr,"OOM raw tokens\n");exit(1);}
-            prompt_tokens=tok_encode(&T,input,input_n,tmp,maxctx-8-g_draft);
+            /* #401 parity with the mux path: tokenize with ONE token of headroom
+             * so overflow is DETECTED, not silently truncated. The old cap of
+             * maxctx-8-g_draft dropped the prompt's tail (tool instructions,
+             * the user's actual turn) and generated from a prompt cut
+             * mid-markup — the exact failure run_serve_mux refuses loudly.
+             * The legacy line protocol has no ERROR frame; END + a STAT line
+             * with 0 produced tokens plus a loud stderr line is its honest
+             * equivalent (the coli client surfaces stderr). */
+            prompt_tokens=tok_encode(&T,input,input_n,tmp,maxctx-1);
+            if(prompt_tokens>maxctx-8-g_draft){
+                fprintf(stderr,"[API] prompt does not fit: >=%d token, usable context is %d (CTX=%d). "
+                               "Raise it, e.g. CTX=32768 -- coding clients send large system prompts.\n",
+                        prompt_tokens,maxctx-8-g_draft,maxctx);
+                free(tmp); free(raw);
+                g_temp=base_temp; g_nuc=base_nuc;
+                printf("\x01\x01" "END" "\x01\x01\n");
+                printf("STAT 0 0.00 0.0 %.2f 0 0\n",rss_gb()); fflush(stdout); continue;
+            }
             int old_len=len, prefix=0;
             while(prefix<old_len && prefix<prompt_tokens && hist[prefix]==tmp[prefix]) prefix++;
             if(prefix<old_len){
