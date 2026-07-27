@@ -213,6 +213,16 @@ tiny all-sliding V4; CSA/HCA configs are refused loudly at load as designed.
 Stage (e) also landed the same night (f73dc37): hash layers route by the
 tid2eid[token] table end-to-end (st.h I64 reader, FASE A hash branch, token
 ids published by all four forward drivers), TF 32/32 with a live hash layer
-and a seeded non-trivial table. Remaining stages: (c) HCA compressor plane,
-(d) CSA + indexer, (f) DSpark. The engine now validates SIX architectures
-end-to-end.
+and a seeded non-trivial table.
+
+Stage (c) landed too (c7fa20f): the Cc compressed-KV plane + ccK/ccG decode
+ring, gated-pool compression with deterministic-position compress-theta rope,
+per-layer main/compress rope split, and compressed rows joining the
+sink-anchored softmax under the reference's causality. TF 32/32 with a live
+HCA layer (rate 4 < window 8, so compressed rows demonstrably matter);
+greedy 20/20 proves the incremental ring.
+
+Remaining stages: (d) CSA + lightning indexer (the Ca/Cb overlap layout +
+scorer — the largest single remaining piece), (f) DSpark. The engine now
+validates SIX architectures end-to-end, V4 in three of its four attention
+modes.
