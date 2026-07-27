@@ -83,6 +83,41 @@ with.
 4. **GQA + paged KV** → Qwen3 + GPT-OSS land together → four families,
    "universal" is earned
 
+## DeepSeek-V4 series + DSpark (added 2026-07-27, from real config + inference/model.py)
+
+**What it is.** DeepSeek-V4: **Pro (1.6T params / 49B active)** and **Flash
+(284B / 13B active)**, both 1M context, experts in **FP4** with FP8 elsewhere.
+`DeepSeek-V4-Pro-DSpark` is NOT a new model: it is V4-Pro plus **DSpark**, a
+speculative-decoding module (Markov head, `dspark_markov_rank=512`, special
+attention on layers 58-60, block size 5 — see github.com/deepseek-ai/DeepSpec).
+
+**Architecture delta (from `inference/model.py`, 961 lines, read directly):**
+
+| Component | V4 reality | Engine gap |
+|---|---|---|
+| MoE | 384 experts, top-6, SwiGLU (`swiglu_limit=10` clamp), FP4 weights | streaming machinery applies as-is; needs an FP4 (e2m1) dequant kernel — same nibble-packing family as the existing int4 path |
+| Router | `sqrtsoftplus` scoring (`sqrt(softplus(x))`) + bias for selection only, weights renormalized, `route_scale=2.5` | one new scoring arm in FASE A (structure identical to sigmoid+noaux_tc) |
+| **Hash routing** | first `num_hash_layers=3` layers route by a `tid2eid[vocab, topk]` table — expert choice known from the TOKEN ID alone | **an advantage unique to a streaming engine**: those layers' experts can be prefetched before the forward even starts; no router matmul at all |
+| Attention | **hybrid CSA/HCA, not MLA**: MQA-ish 1 KV head × `head_dim=512`, learned KV compression (`Compressor`: gated pooling over 4-token windows with overlap, or heavy 128× ratio per `compress_ratios[]`), `o_groups=16`/`o_lora_rank=1024` output projection, YaRN to 1M | **new forward pass** — this is the bulk of the work |
+| Residual | **mHC hyper-connections**: `hc_mult=4` parallel residual streams mixed by Sinkhorn-projected matrices per layer | changes the layer skeleton; second-largest work item |
+| Indexer | still present (`index_topk=1024`, 64 heads × 128 dim) | engine's DSA indexer is this exact lineage |
+| MTP | `num_nextn_predict_layers=1` | engine's MTP framework applies |
+| DSpark | draft via Markov head + `DSparkAttention` on 3 target layers | engine's spec_decode framework is the right home; new draft math; optional |
+
+**Sizing.** V4-Flash at FP4 experts ≈ **~150 GB-class container** — smaller than
+GLM's 372 GB; streams from a single NVMe. V4-Pro ≈ 1.6T → ~800 GB-class at FP4:
+the "1.6-TRILLION params on consumer hardware" headline, strictly bigger than
+K2's.
+
+**Ladder position.** V4 is the biggest target on the board because CSA/HCA + mHC
+are a new engine core, not a port. Sequence stays: V3/R1 group routing → K2 →
+**V4-Flash** (small download, full V4 architecture) → V4-Pro → DSpark module.
+The FP4 kernel and `sqrtsoftplus` arm can land early (locally testable); hash
+routing should land with them (it is pure engine-side and the prefetch win is
+free). CSA/HCA + mHC get their own design doc before any code.
+
+
+
 ## Positioning
 
 > Run a 1-trillion-parameter model on the PC you already own.
