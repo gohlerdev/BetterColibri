@@ -5,3 +5,5 @@ olmoe_i4/
 .build-config
 tests/test_st_mirror
 tests/test_st_pread
+ds3_tiny/
+ref_ds3.json
