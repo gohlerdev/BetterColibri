@@ -82,6 +82,7 @@ static const int *g_pre_idx; static const float *g_pre_w; static const int *g_pr
 typedef struct {
     int hidden, n_layers, n_heads, n_experts, topk, moe_inter, dense_inter;
     int first_dense, q_lora, kv_lora, qk_nope, qk_rope, qk_head, v_head, n_shared, vocab;
+    int gqa, n_kv_heads, head_dim;                /* famiglia GQA (qwen3_moe): K/V per testa */
     int n_group, topk_group, norm_topk;
     int score_func;                              /* 0=sigmoid (GLM/DSv3), 1=softmax (Qwen3), 2=sqrtsoftplus (DSv4) */
     int n_hash_layers;                           /* DSv4: first N layers route by token-ID table (tid2eid) */
@@ -136,6 +137,8 @@ typedef struct {
     float *in_ln, *post_ln;
     /* MLA (densa, quantizzata) */
     QT q_a, q_b, kv_a, kv_b, o; float *q_a_ln, *kv_a_ln;
+    /* GQA (qwen3_moe): proiezioni classiche + norme per-head */
+    QT q_proj, k_proj, v_proj; float *q_norm, *k_norm;
 #ifdef COLI_CUDA
     ColiCudaTensor *kv_b_shard[COLI_CUDA_MAX_DEVICES];
     int shard_h0[COLI_CUDA_MAX_DEVICES],shard_hn[COLI_CUDA_MAX_DEVICES],n_kv_b_shard;
@@ -914,6 +917,22 @@ static void rope_interleave(float *v, int pos, const Cfg *c){
     }
 }
 
+/* RoPE split-half (rotate_half, Llama/Qwen): coppie (v[j], v[half+j]) invece
+ * delle coppie adiacenti dell'interleaved. E' la rotazione che Qwen3 applica a
+ * TUTTO head_dim (non solo a una porzione rope come la MLA DeepSeek); ordine
+ * pinnato float-level da tools/make_qwen3_oracle.py --l0check. */
+static void rope_splithalf(float *v, int pos, int hd, float theta){
+    int half=hd/2;
+    if(hd>256){ fprintf(stderr,"head_dim=%d exceeds rope_splithalf buffer (256)\n",hd); exit(1); }
+    float in[256]; memcpy(in,v,(size_t)hd*sizeof(float));
+    for(int j=0;j<half;j++){
+        float inv=powf(theta,-2.0f*j/hd),ang=pos*inv;
+        float cs=cosf(ang),sn=sinf(ang);
+        v[j]      = in[j]*cs      - in[half+j]*sn;
+        v[half+j] = in[half+j]*cs + in[j]*sn;
+    }
+}
+
 /* ---------- config ---------- */
 /* SEC-9: bounded slurp for untrusted config/oracle JSON. config.json arrives from
  * unverified mirrors (see qt_check_fmt threat model); an unbounded ftell->malloc
@@ -954,12 +973,43 @@ static void load_cfg(Cfg *c, const char *snap){
     c->qk_nope=gi(r,"qk_nope_head_dim"); c->qk_rope=gi(r,"qk_rope_head_dim");
     c->v_head=gi(r,"v_head_dim"); c->n_shared=gi(r,"n_shared_experts"); c->vocab=gi(r,"vocab_size");
     c->n_group=gi(r,"n_group"); c->topk_group=gi(r,"topk_group");
+    /* Famiglia GQA (qwen3_moe): model_type e' il discriminante. La mappa campi
+     * diverge da DeepSeek: num_experts (non n_routed_experts), head_dim esplicito,
+     * num_key_value_heads < num_attention_heads, NIENTE q/kv_lora ne' shared
+     * expert ne' layer densi (decoder_sparse_step=1, mlp_only_layers=[]), router
+     * softmax senza bias. Riusiamo i campi MLA per le forme GQA: kv_lora =
+     * KVH*head_dim (riga K della cache), qk_rope = KVH*head_dim (riga V: la
+     * Rc esiste gia' per-token, dimensionata a qk_rope). */
+    { jval *mt=json_get(r,"model_type");
+      c->gqa = mt && mt->t==J_STR && mt->str && !strcmp(mt->str,"qwen3_moe");
+      if(c->gqa){
+          c->n_kv_heads=gi(r,"num_key_value_heads");
+          c->head_dim=gi(r,"head_dim");
+          if(c->head_dim<1 && c->n_heads>0) c->head_dim=c->hidden/c->n_heads;
+          c->n_experts=gi(r,"num_experts");
+          if(c->n_experts<1) c->n_experts=gi(r,"num_local_experts");  /* alias HF to_dict */
+          c->first_dense=0;                       /* tutti i layer sono MoE */
+          c->n_shared=0;                          /* nessun shared expert */
+          c->q_lora=0;
+          c->qk_nope=0;
+          c->v_head=c->head_dim;
+          c->qk_head=c->head_dim;
+          c->kv_lora=c->n_kv_heads*c->head_dim;   /* riga K cache (Lc) */
+          c->qk_rope=c->n_kv_heads*c->head_dim;   /* riga V cache (Rc) */
+          c->score_func=1;                        /* router softmax, sempre */
+          if(c->n_kv_heads<1 || c->n_heads%c->n_kv_heads){
+              fprintf(stderr,"config: num_key_value_heads=%d must divide num_attention_heads=%d\n",
+                      c->n_kv_heads,c->n_heads); exit(1); }
+          fprintf(stderr,"[GQA] qwen3_moe: %d q-heads / %d kv-heads, head_dim %d, %d experts top-%d (softmax router)\n",
+                  c->n_heads,c->n_kv_heads,c->head_dim,c->n_experts,c->topk);
+      } }
     jval *nt=json_get(r,"norm_topk_prob"); c->norm_topk=(nt&&nt->t==J_BOOL)?nt->boolean:0;
     /* Router scoring function (multi-model): GLM/DeepSeek ship "sigmoid",
      * DeepSeek-V4 "sqrtsoftplus", Qwen3-class configs omit it (softmax
      * semantics) but ALSO omit n_routed_experts — absent field defaults to
      * sigmoid so every currently-loadable model keeps its exact old path. */
     { jval *sf=json_get(r,"scoring_func");
+      if(!c->gqa){                              /* GQA (qwen3) ha gia' fissato softmax */
       c->score_func=0;
       if(sf && sf->t==J_STR && sf->str){
           if(!strcmp(sf->str,"softmax")) c->score_func=1;
@@ -967,7 +1017,7 @@ static void load_cfg(Cfg *c, const char *snap){
           else if(strcmp(sf->str,"sigmoid")){
               fprintf(stderr,"config: unknown scoring_func '%s' (sigmoid|softmax|sqrtsoftplus)\n",sf->str);
               exit(1); }
-      } }
+      } } }
     /* DSv4 hash routing: the first num_hash_layers MoE layers take their expert
      * INDICES from a per-layer tid2eid[vocab, topk] table keyed by the input
      * token id (reference Gate: indices = self.tid2eid[input_ids]); gate
@@ -1027,8 +1077,8 @@ static void load_cfg(Cfg *c, const char *snap){
               c->idx_type[i] = !strcmp(it->kids[i]->str,"full");
           else { int v=i-off+1; if(v<0) v=0; c->idx_type[i] = (v%freq)==0; }
       } }
-    c->qk_head=c->qk_nope+c->qk_rope;
-    c->attn_scale = 1.f / sqrtf((float)c->qk_head);
+    if(!c->gqa) c->qk_head=c->qk_nope+c->qk_rope;   /* GQA: qk_head=head_dim gia' fissato */
+    c->attn_scale = 1.f / sqrtf((float)(c->gqa?c->head_dim:c->qk_head));
     /* DeepSeek-V3 group-limited routing (n_group>1, topk_group groups kept) is
      * supported since the multi-model work: validate the shape instead of
      * refusing. GLM-5.2 ships n_group=1 and keeps its exact old path. */
@@ -1056,7 +1106,7 @@ static void load_cfg(Cfg *c, const char *snap){
     CKR("n_group",c->n_group,1,256)              CKR("topk_group",c->topk_group,1,256)
     CKR("intermediate_size",c->dense_inter,1,1<<24) CKR("first_k_dense_replace",c->first_dense,0,c->n_layers)
     CKR("q_lora_rank",c->q_lora,0,1<<20)         CKR("kv_lora_rank",c->kv_lora,1,1<<20)
-    CKR("qk_nope_head_dim",c->qk_nope,1,1<<16)   CKR("qk_rope_head_dim",c->qk_rope,1,1<<16)
+    CKR("qk_nope_head_dim",c->qk_nope,c->gqa?0:1,1<<16) CKR("qk_rope_head_dim",c->qk_rope,1,1<<16)
     CKR("v_head_dim",c->v_head,1,1<<16)          CKR("n_shared_experts",c->n_shared,0,64)
     CKR("vocab_size",c->vocab,1,1<<24)           CKR("index_topk",c->index_topk,0,1<<20)
     CKR("index_n_heads",c->index_nh,0,1024)      CKR("index_head_dim",c->index_hd,0,1<<16)
@@ -1264,6 +1314,15 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         #define P(s) (snprintf(nm,sizeof(nm),"model.layers.%d." s,i),nm)
         l->in_ln=ld(m,P("input_layernorm.weight"));
         l->post_ln=ld(m,P("post_attention_layernorm.weight"));
+        if(c->gqa){
+            /* Qwen3: q/k/v/o classici + RMSNorm per-head su q e k */
+            l->q_proj = qt_load(m,P("self_attn.q_proj.weight"), H*c->head_dim, D, dbits);
+            l->k_proj = qt_load(m,P("self_attn.k_proj.weight"), c->n_kv_heads*c->head_dim, D, dbits);
+            l->v_proj = qt_load(m,P("self_attn.v_proj.weight"), c->n_kv_heads*c->head_dim, D, dbits);
+            l->o      = qt_load(m,P("self_attn.o_proj.weight"), D, H*c->head_dim, dbits);
+            l->q_norm = ld(m,P("self_attn.q_norm.weight"));
+            l->k_norm = ld(m,P("self_attn.k_norm.weight"));
+        } else {
         l->q_a   = qt_load(m,P("self_attn.q_a_proj.weight"), c->q_lora, D, dbits);
         l->q_a_ln= ld(m,P("self_attn.q_a_layernorm.weight"));
         l->q_b   = qt_load(m,P("self_attn.q_b_proj.weight"), H*c->qk_head, c->q_lora, dbits);
@@ -1271,6 +1330,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         l->kv_a_ln= ld(m,P("self_attn.kv_a_layernorm.weight"));
         l->kv_b  = qt_load(m,P("self_attn.kv_b_proj.weight"), H*(c->qk_nope+c->v_head), c->kv_lora, dbits);
         l->o     = qt_load(m,P("self_attn.o_proj.weight"), D, H*c->v_head, dbits);
+        }
 #ifdef COLI_CUDA
         qt_cuda_colocate(&l->o,&l->kv_b);
         qt_cuda_colocate(&l->q_a,&l->kv_b);   /* PIPE: intera catena attention sulla */
@@ -1286,6 +1346,12 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             l->down_proj = qt_load(m,P("mlp.down_proj.weight"), D, c->dense_inter, dbits);
         } else {
             l->router=ld(m,P("mlp.gate.weight"));
+            if(c->gqa){
+                /* Qwen3: router softmax puro, senza bias di correzione e senza
+                 * shared expert. Bias a zero = percorso FASE A invariato. */
+                l->router_bias=(float*)qalloc((size_t)c->n_experts*sizeof(float));
+                memset(l->router_bias,0,(size_t)c->n_experts*sizeof(float));
+            } else {
             l->router_bias=ld(m,P("mlp.gate.e_score_correction_bias"));
             int sI=c->moe_inter*c->n_shared;
             l->sh_gate = qt_load(m,P("mlp.shared_experts.gate_proj.weight"), sI, D, dbits);
@@ -1296,6 +1362,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             qt_cuda_colocate(&l->sh_up,&l->sh_gate);
             qt_cuda_colocate(&l->sh_down,&l->sh_gate);
 #endif
+            }
             m->ecache[i]=calloc(cap,sizeof(ESlot));
             m->eroute[i]=calloc(c->topk,sizeof(int));      /* metodo C: ultimo routing del layer */
             m->eusage[i]=calloc(c->n_experts,sizeof(uint32_t));
@@ -2499,11 +2566,82 @@ done:
 }
 #endif
 
+/* ---- GQA attention (qwen3_moe) --------------------------------------------
+ * Attention classica a K/V per testa, con la matematica pinnata float-level da
+ * tools/make_qwen3_oracle.py --l0check contro transformers:
+ *   q/k/v = proiezioni dirette; RMSNorm PER-HEAD su q,k (head_dim) PRIMA della
+ *   RoPE; RoPE split-half (rotate_half) su tutto head_dim; mappa GQA
+ *   kv_head = h / (H/KVH); softmax causale scala 1/sqrt(head_dim); out o_proj.
+ * Cache: riusa Lc/Rc della MLA — Lc[t] = K roped [KVH*hd], Rc[t] = V [KVH*hd]
+ * (load_cfg ha dimensionato kv_lora e qk_rope a KVH*hd apposta). Righe ragged
+ * (kvs/positions) come il percorso absorb: per-row KVState e posizione. */
+static void attention_gqa(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
+                          KVState *const *kvs, const int *positions, float *out){
+    Cfg *c=&m->c; int H=c->n_heads, hd=c->head_dim, KVH=c->n_kv_heads;
+    int grp=H/KVH, kvw=KVH*hd;
+    float *Q=falloc((int64_t)S*H*hd), *KK=falloc((int64_t)S*kvw), *VV=falloc((int64_t)S*kvw);
+    matmul_qt_ex(Q, x,&l->q_proj,S,0); matmul_qt_ex(KK,x,&l->k_proj,S,0);
+    matmul_qt_ex(VV,x,&l->v_proj,S,0);
+    /* per-head RMSNorm (q_norm/k_norm) + RoPE split-half, poi scrivi K/V in cache */
+    for(int s=0;s<S;s++){
+        int pos = positions?positions[s]:pos_base+s;
+        KVState *ks = kvs?kvs[s]:m->kv;
+        float *q=Q+(int64_t)s*H*hd;
+        for(int h=0;h<H;h++){
+            float tmp[256];
+            rmsnorm(tmp,q+(int64_t)h*hd,l->q_norm,hd,c->eps);
+            memcpy(q+(int64_t)h*hd,tmp,(size_t)hd*sizeof(float));
+            rope_splithalf(q+(int64_t)h*hd,pos,hd,c->theta);
+        }
+        float *k=KK+(int64_t)s*kvw, *v=VV+(int64_t)s*kvw;
+        for(int h=0;h<KVH;h++){
+            float tmp[256];
+            rmsnorm(tmp,k+(int64_t)h*hd,l->k_norm,hd,c->eps);
+            memcpy(k+(int64_t)h*hd,tmp,(size_t)hd*sizeof(float));
+            rope_splithalf(k+(int64_t)h*hd,pos,hd,c->theta);
+        }
+        memcpy(coli_kv_row(ks->Lc[layer],pos,c->kv_lora), k, (size_t)kvw*sizeof(float));
+        memcpy(coli_kv_row(ks->Rc[layer],pos,c->qk_rope), v, (size_t)kvw*sizeof(float));
+    }
+    /* score/softmax/value per riga e testa, causale sulla cache della riga */
+    float *ao=falloc((int64_t)S*H*hd);
+    #pragma omp parallel for collapse(2) schedule(static)
+    for(int s=0;s<S;s++) for(int h=0;h<H;h++){
+        int pos = positions?positions[s]:pos_base+s;
+        KVState *ks = kvs?kvs[s]:m->kv;
+        int st0 = ks->kv_start[layer]; int Tn = pos+1;
+        int kvh = h/grp;
+        const float *q = Q+(int64_t)s*H*hd + (int64_t)h*hd;
+        float *sc = malloc((size_t)(Tn-st0)*sizeof(float));
+        float mx=-1e30f;
+        for(int t=st0;t<Tn;t++){
+            const float *kt = coli_kv_row(ks->Lc[layer],t,c->kv_lora) + (int64_t)kvh*hd;
+            float acc=0; for(int j=0;j<hd;j++) acc+=q[j]*kt[j];
+            acc*=c->attn_scale; sc[t-st0]=acc; if(acc>mx) mx=acc;
+        }
+        float sum=0;
+        for(int t=0;t<Tn-st0;t++){ sc[t]=expf(sc[t]-mx); sum+=sc[t]; }
+        float inv=1.f/(sum+1e-20f);
+        float *dst=ao+(int64_t)s*H*hd+(int64_t)h*hd;
+        for(int j=0;j<hd;j++) dst[j]=0;
+        for(int t=st0;t<Tn;t++){
+            const float *vt = coli_kv_row(ks->Rc[layer],t,c->qk_rope) + (int64_t)kvh*hd;
+            float w=sc[t-st0]*inv;
+            for(int j=0;j<hd;j++) dst[j]+=w*vt[j];
+        }
+        free(sc);
+    }
+    matmul_qt_ex(out,ao,&l->o,S,0);
+    free(Q); free(KK); free(VV); free(ao);
+}
+
 static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
                            KVState *const *kvs, const int *positions, float *out){
     Cfg *c=&m->c; int H=c->n_heads, D=c->hidden, qh=c->qk_head, vh=c->v_head;
     int kvb_dim=H*(c->qk_nope+vh), Tk=pos_base+S;
     double ta0=now_s();
+    if(c->gqa){ attention_gqa(m,l,layer,x,S,pos_base,kvs,positions,out);
+                m->t_attn+=now_s()-ta0; return; }
 #ifdef COLI_METAL
     /* Fused decode attention on GPU: whole layer in one command buffer (keeps the GPU hot).
      * S<=4 absorption path with st0==0, DSA selection inactive, and GLM-5.2 int4 dims.
@@ -3677,7 +3815,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         }
     }
     /* ---- FASE E: shared expert (PIPE2: gia' sul device; Metal CB: gia' sommata) ---- */
-    if(!with_shared) goto shared_done;
+    if(!with_shared || c->n_shared==0) goto shared_done;   /* qwen3: nessun shared expert */
     {
     float *sg=NULL,*su=NULL;int shared_cuda=0;
 #ifdef COLI_METAL
