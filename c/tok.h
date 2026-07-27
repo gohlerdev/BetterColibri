@@ -20,6 +20,7 @@
 #include "json.h"
 #include "tok_unicode.h"
 #include "tok_unicode_o200k.h"
+#include "tok_unicode_han.h"
 
 /* ---------- hash map (chiavi binarie con lunghezza) ---------- */
 typedef struct { const char *k; int klen; int v; int used; } ment;
@@ -52,6 +53,8 @@ typedef struct {
     uint32_t byte2cp[256]; int byte2cp_len[256]; char byte2str[256][3];
     int16_t cp2byte[1024];
     int o200k;           /* pre_tokenizer regex family: 0 = cl100k (GLM), 1 = o200k (Inkling) */
+    int k2;              /* 1 = Kimi-K2 (tiktoken): rami o200k con [\p{Han}]+ in testa,
+                          * classi lettera &&[^\p{Han}], coda punteggiatura senza '/' */
 } Tok;
 
 /* ---------- UTF-8 ---------- */
@@ -173,14 +176,17 @@ static void tok_load(Tok *T, const char *path){
         qsort(T->sp,T->nsp,sizeof(Special),cmp_sp_len);   /* match piu' lungo per primo */
     }
     /* pre_tokenizer family: the o200k Split regex is recognizable by its
-     * case-category classes (\p{Lu}...) which cl100k does not use */
+     * case-category classes (\p{Lu}...) which cl100k does not use; the K2
+     * (Kimi) variant is o200k plus a leading [\p{Han}]+ arm — \p{Han} is its
+     * fingerprint and must be checked first (the pattern has \p{Lu} too). */
     jval *pt=json_get(root,"pre_tokenizer");
     if(pt){
         jval *ps=json_get(pt,"pretokenizers");
         if(ps&&ps->t==J_ARR) for(int i=0;i<ps->len;i++){
             jval *pat=json_get(ps->kids[i],"pattern");
             jval *rx=pat?json_get(pat,"Regex"):NULL;
-            if(rx&&rx->t==J_STR&&strstr(rx->str,"\\p{Lu}")) T->o200k=1;
+            if(rx&&rx->t==J_STR&&strstr(rx->str,"\\p{Han}"))     T->k2=1;
+            else if(rx&&rx->t==J_STR&&strstr(rx->str,"\\p{Lu}")) T->o200k=1;
         }
     }
     /* arena/buf restano allocati: le stringhe (j_dup) sono malloc indipendenti e ci servono vive */
@@ -290,6 +296,12 @@ static void pretok_chunk(Tok *T, const unsigned char *p, int a, int b, int *out,
  * maximally-greedy S1* given back until S2+ can take >=1 char, then B. */
 #define O2_S1(c) (is_U(c)||is_X(c))
 #define O2_S2(c) (is_X(c)||(is_L(c)&&!is_U(c)))
+/* K2 (Kimi): stesse classi ma con &&[^\p{Han}] — l'ideogramma appartiene SOLO
+ * al ramo [\p{Han}]+ che precede i rami lettera. \p{Han} include Lm/Lo di
+ * script Han (々 U+3005, i radicali Kangxi), quindi l'intersezione non e'
+ * ridondante: senza di essa 々 finirebbe nel run di lettere. */
+static int o2_s1(uint32_t c, int k2){ return O2_S1(c) && !(k2 && is_HAN(c)); }
+static int o2_s2(uint32_t c, int k2){ return O2_S2(c) && !(k2 && is_HAN(c)); }
 static uint32_t o2_low(uint32_t c){ return (c>='A'&&c<='Z')?c+32:c; }
 static int o2_contraction(const uint32_t *cp, int n, int k){
     if(k<n && cp[k]=='\'' && k+1<n){
@@ -301,7 +313,7 @@ static int o2_contraction(const uint32_t *cp, int n, int k){
     return k;
 }
 /* end (cp index) of branch A|B match at i, or -1 */
-static int o2_letters(const uint32_t *cp, int n, int i){
+static int o2_letters(const uint32_t *cp, int n, int i, int k2){
     /* branch A, prefix greedy (taken first), then without prefix */
     for(int pfx=1; pfx>=0; pfx--){
         int j0=i;
@@ -310,10 +322,10 @@ static int o2_letters(const uint32_t *cp, int n, int i){
             if(c=='\r'||c=='\n'||is_L(c)||is_N(c)||i+1>=n) continue;
             j0=i+1;
         }
-        int m1=j0; while(m1<n && O2_S1(cp[m1])) m1++;
+        int m1=j0; while(m1<n && o2_s1(cp[m1],k2)) m1++;
         for(int s=m1; s>=j0; s--){
-            if(s<n && O2_S2(cp[s])){
-                int k=s+1; while(k<n && O2_S2(cp[k])) k++;
+            if(s<n && o2_s2(cp[s],k2)){
+                int k=s+1; while(k<n && o2_s2(cp[k],k2)) k++;
                 return o2_contraction(cp,n,k);
             }
         }
@@ -326,16 +338,16 @@ static int o2_letters(const uint32_t *cp, int n, int i){
             if(c=='\r'||c=='\n'||is_L(c)||is_N(c)||i+1>=n) continue;
             j0=i+1;
         }
-        int m1=j0; while(m1<n && O2_S1(cp[m1])) m1++;
+        int m1=j0; while(m1<n && o2_s1(cp[m1],k2)) m1++;
         if(m1>j0){
-            int k=m1; while(k<n && O2_S2(cp[k])) k++;
+            int k=m1; while(k<n && o2_s2(cp[k],k2)) k++;
             return o2_contraction(cp,n,k);
         }
     }
     return -1;
 }
 
-static void pretok_chunk_o200k(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max){
+static void pretok_chunk_o200k(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max, int k2){
     int nb=b-a; if(nb<=0) return;
     uint32_t *cp=malloc((nb+1)*sizeof(uint32_t)); int *off=malloc((nb+2)*sizeof(int)); int n=0;
     for(int i=a;i<b;){ uint32_t c; int k=u8_next(p,b,i,&c); off[n]=i; cp[n]=c; n++; i+=k; }
@@ -344,20 +356,25 @@ static void pretok_chunk_o200k(Tok *T, const unsigned char *p, int a, int b, int
     int i=0;
     while(i<n){
         int start=i; uint32_t c=cp[i];
+        /* K2 arm 1: [\p{Han}]+ — tried before the letter arms, as in pat_str */
+        if(k2 && is_HAN(c)){
+            int j=i; while(j<n && is_HAN(cp[j])) j++;
+            i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
+        }
         /* A|B: letter runs with case-aware split + optional contraction */
         {
-            int e=o2_letters(cp,n,i);
+            int e=o2_letters(cp,n,i,k2);
             if(e>i){ i=e; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
         }
         /* C: \p{N}{1,3} */
         if(is_N(c)){ int j=i,k=0; while(j<n && is_N(cp[j]) && k<3){ j++; k++; } i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
-        /* D: ' ?[^\s\p{L}\p{N}]+[\r\n/]*' */
+        /* D: ' ?[^\s\p{L}\p{N}]+[\r\n/]*'  (K2 drops the '/' from the tail) */
         {
             int j=i;
             if(c==' ' && j+1<n && !is_S(cp[j+1]) && !is_L(cp[j+1]) && !is_N(cp[j+1])) j++;
             if(j<n && !is_S(cp[j]) && !is_L(cp[j]) && !is_N(cp[j])){
                 while(j<n && !is_S(cp[j]) && !is_L(cp[j]) && !is_N(cp[j])) j++;
-                while(j<n && (ISNL(cp[j]) || cp[j]=='/')) j++;
+                while(j<n && (ISNL(cp[j]) || (!k2 && cp[j]=='/'))) j++;
                 i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
             }
         }
@@ -392,8 +409,8 @@ static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
         }
         int chunk_end = (hitpos<0) ? len : hitpos;
         if(chunk_end>i){
-            if(T->o200k) pretok_chunk_o200k(T,p,i,chunk_end,out,&no,max);
-            else         pretok_chunk(T,p,i,chunk_end,out,&no,max);
+            if(T->o200k||T->k2) pretok_chunk_o200k(T,p,i,chunk_end,out,&no,max,T->k2);
+            else                pretok_chunk(T,p,i,chunk_end,out,&no,max);
         }
         if(hitpos<0) break;
         if(no<max) out[no++]=hitid;
