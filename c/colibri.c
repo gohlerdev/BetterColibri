@@ -88,6 +88,8 @@ typedef struct {
     int v4, rope_hd, o_groups, o_lora;            /* deepseek_v4: MQA K==V + mHC (V4_DESIGN stadio b) */
     int hc_mult, hc_iters; float hc_eps, swiglu;
     unsigned char hash_layer[128];                /* stadio e: mlp_layer_types[i]=="hash_moe" */
+    unsigned char hca[128]; int hca_rate;         /* stadio c: heavily_compressed_attention */
+    float theta_comp;                             /* rope_parameters.compress.rope_theta */
     int n_group, topk_group, norm_topk;
     int score_func;                              /* 0=sigmoid (GLM/DSv3), 1=softmax (Qwen3), 2=sqrtsoftplus (DSv4) */
     int n_hash_layers;                           /* DSv4: first N layers route by token-ID table (tid2eid) */
@@ -150,6 +152,7 @@ typedef struct {
     /* deepseek_v4: MQA + grouped-O + mHC (V4_DESIGN stadio b) */
     QT kv_proj, o_b; float *o_a_w; float *kv_ln;   /* o_a: block-diag f32 [g*olr, H*hd/g] */
     int32_t *tid2eid;                              /* hash layer (stadio e): [vocab, topk], -1 = slot vuoto */
+    QT c_kv, c_gate; float *c_ln, *c_pb;           /* HCA compressor (stadio c): proiezioni + norm + position_bias [rate,hd] */
     float *hc_attn_fn, *hc_attn_base, *hc_attn_scale;   /* [(2+hc)*hc, hc*D], [(2+hc)*hc], [3] */
     float *hc_ffn_fn,  *hc_ffn_base,  *hc_ffn_scale;
 #ifdef COLI_CUDA
@@ -183,6 +186,7 @@ typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
 
 typedef struct {
     float **Lc, **Rc, **Ic;
+    float **Cc, **ccK, **ccG; int *cc_len;       /* DSv4 HCA: righe compresse + ring finestra corrente */
     int *kv_start, max_t;
     int disk_nrec;
     char disk_path[2048];
@@ -1054,13 +1058,22 @@ static void load_cfg(Cfg *c, const char *snap){
           { jval *sw=json_get(r,"swiglu_limit"); c->swiglu=sw?(float)sw->num:10.f; }
           c->sliding=gi(r,"sliding_window");
           { jval *lt=json_get(r,"layer_types");
+            int nhca=0;
             for(int i=0;i<c->n_layers && i<128;i++){
                 const char *t=(lt&&lt->t==J_ARR&&i<lt->len&&lt->kids[i]->t==J_STR)?lt->kids[i]->str:NULL;
-                if(t && strcmp(t,"sliding_attention")){
+                if(t && !strcmp(t,"heavily_compressed_attention")){ c->hca[i]=1; nhca++; }
+                else if(t && strcmp(t,"sliding_attention")){
                     fprintf(stderr,"config: deepseek_v4 layer_types[%d]='%s' not supported yet "
-                                   "(V4_DESIGN stadio b: sliding_attention only; CSA/HCA compressors pending)\n",i,t);
+                                   "(V4_DESIGN stadi b+c: sliding|HCA; CSA/indexer pending)\n",i,t);
                     exit(1); }
                 c->swa[i]=c->sliding;
+            }
+            if(nhca){
+                jval *cr=json_get(r,"compress_rates");
+                jval *hr=cr?json_get(cr,"heavily_compressed_attention"):NULL;
+                c->hca_rate=hr?(int)hr->num:128;
+                if(c->hca_rate<2||c->hca_rate>4096){ fprintf(stderr,"config: hca compress rate %d out of range\n",c->hca_rate); exit(1); }
+                fprintf(stderr,"[V4] HCA on %d layer(s): 1 compressed KV row per %d tokens\n",nhca,c->hca_rate);
             } }
           { jval *ml=json_get(r,"mlp_layer_types");
             int nhash=0;
@@ -1154,6 +1167,8 @@ static void load_cfg(Cfg *c, const char *snap){
     jval *rp=json_get(r,"rope_parameters"); jval *th=rp?json_get(rp,"rope_theta"):NULL;
     if(c->v4 && rp){ jval *mn=json_get(rp,"main"); if(mn) th=json_get(mn,"rope_theta"); }
     c->theta = th?(float)th->num:10000.f;
+    if(c->v4){ jval *cm=rp?json_get(rp,"compress"):NULL; jval *ct=cm?json_get(cm,"rope_theta"):NULL;
+               c->theta_comp=ct?(float)ct->num:160000.f; }
     /* Tabella RoPE per le famiglie GQA: inv_freq di default o YaRN (gpt_oss),
      * replica esatta di transformers _compute_yarn_parameters (truncate incluso)
      * + attention_scaling moltiplicato su cos/sin. Pinnata da make_gptoss_oracle
@@ -1490,6 +1505,12 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             l->o_a_w = ld(m,P("self_attn.o_a_proj.weight"));
             l->o_b   = qt_load(m,P("self_attn.o_b_proj.weight"), D, c->o_groups*c->o_lora, dbits);
             l->sinks = ld(m,P("self_attn.sinks"));
+            if(i<128 && c->hca[i]){
+                l->c_kv  = qt_load(m,P("self_attn.compressor.kv_proj.weight"),   c->head_dim, D, dbits);
+                l->c_gate= qt_load(m,P("self_attn.compressor.gate_proj.weight"), c->head_dim, D, dbits);
+                l->c_ln  = ld(m,P("self_attn.compressor.kv_norm.weight"));
+                l->c_pb  = ld(m,P("self_attn.compressor.position_bias"));
+            }
             l->hc_attn_fn   = ld(m,P("attn_hc.fn"));
             l->hc_attn_base = ld(m,P("attn_hc.base"));
             l->hc_attn_scale= ld(m,P("attn_hc.scale"));
@@ -2900,9 +2921,53 @@ static void rmsnorm_nw(float *v, int n, float eps){
     float r=1.f/sqrtf((float)(ms/n)+eps);
     for(int i=0;i<n;i++) v[i]*=r;
 }
+/* HCA (stadio c): aggiorna il piano compresso del layer con le righe s..S-1 di
+ * questo forward. Ogni finestra CHIUSA di `rate` token emette una riga:
+ * softmax fp32 sui gate (wgate(x)+position_bias) sull'asse finestra, somma
+ * pesata dei kv, RMS-norm, rope parziale alla posizione DETERMINISTICA
+ * w*rate con theta_comp. Stato incrementale nel ring ccK/ccG (decode). */
+static void v4_hca_update(Model *m, Layer *l, int layer, const float *x, int S, int pos_base,
+                          KVState *ks){
+    Cfg *c=&m->c; int hd=c->head_dim, rate=c->hca_rate, rd=c->rope_hd;
+    float *kv=falloc((int64_t)S*hd), *gt=falloc((int64_t)S*hd);
+    matmul_qt_ex(kv,(float*)x,&l->c_kv,S,0);
+    matmul_qt_ex(gt,(float*)x,&l->c_gate,S,0);
+    for(int s=0;s<S;s++){
+        int pos=pos_base+s, slot=pos%rate;
+        memcpy(ks->ccK[layer]+(int64_t)slot*hd, kv+(int64_t)s*hd, (size_t)hd*sizeof(float));
+        /* gate + position_bias[slot] */
+        float *gd=ks->ccG[layer]+(int64_t)slot*hd;
+        const float *pb=l->c_pb+(int64_t)slot*hd;
+        for(int j=0;j<hd;j++) gd[j]=gt[(int64_t)s*hd+j]+pb[j];
+        if(slot==rate-1){                          /* finestra chiusa: emetti riga w */
+            int w=pos/rate;
+            float *dst=ks->Cc[layer]+(int64_t)w*hd;
+            /* softmax per-dimensione sull'asse finestra (fp32) */
+            for(int j=0;j<hd;j++){
+                float mx=-1e30f;
+                for(int r=0;r<rate;r++){ float g=ks->ccG[layer][(int64_t)r*hd+j]; if(g>mx) mx=g; }
+                float sum=0, acc=0;
+                for(int r=0;r<rate;r++){
+                    float e=expf(ks->ccG[layer][(int64_t)r*hd+j]-mx);
+                    sum+=e; acc+=e*ks->ccK[layer][(int64_t)r*hd+j];
+                }
+                dst[j]=acc/(sum+1e-20f);
+            }
+            float tmp[512];
+            rmsnorm(tmp,dst,l->c_ln,hd,c->eps);
+            rope_v4(tmp,w*rate,hd,rd,c->theta_comp,1.f);
+            memcpy(dst,tmp,(size_t)hd*sizeof(float));
+            ks->cc_len[layer]=w+1;
+        }
+    }
+    free(kv); free(gt);
+}
 static void attention_v4(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
                          KVState *const *kvs, const int *positions, float *out){
     Cfg *c=&m->c; int H=c->n_heads, hd=c->head_dim, rd=c->rope_hd;
+    /* rope per-layer: sliding-only usa theta "main"; i layer HCA/CSA usano il
+     * theta "compress" ANCHE per q/kv (rope_layer_type del riferimento). */
+    float th = (layer<128 && c->hca[layer]) ? c->theta_comp : c->theta;
     double ta0=now_s();
     float *QR=falloc((int64_t)S*c->q_lora), *Q=falloc((int64_t)S*H*hd), *KV=falloc((int64_t)S*hd);
     matmul_qt_ex(QR,x,&l->q_a,S,0);
@@ -2918,14 +2983,21 @@ static void attention_v4(Model *m, Layer *l, int layer, float *x, int S, int pos
         float *q=Q+(int64_t)s*H*hd;
         for(int h=0;h<H;h++){
             rmsnorm_nw(q+(int64_t)h*hd,hd,c->eps);
-            rope_v4(q+(int64_t)h*hd,pos,hd,rd,c->theta,1.f);
+            rope_v4(q+(int64_t)h*hd,pos,hd,rd,th,1.f);
         }
         float tmp[512];
         if(hd>512){ fprintf(stderr,"head_dim too big for v4 path\n"); exit(1); }
         rmsnorm(tmp,KV+(int64_t)s*hd,l->kv_ln,hd,c->eps);
-        rope_v4(tmp,pos,hd,rd,c->theta,1.f);
+        rope_v4(tmp,pos,hd,rd,th,1.f);
         memcpy(KV+(int64_t)s*hd,tmp,(size_t)hd*sizeof(float));
         memcpy(coli_kv_row(ks->Lc[layer],pos,c->kv_lora),tmp,(size_t)hd*sizeof(float));
+    }
+    /* HCA: aggiorna il piano compresso (ragged: per-riga sul proprio KVState) */
+    int is_hca = layer<128 && c->hca[layer] && c->hca_rate>0;
+    if(is_hca){
+        if(!kvs) v4_hca_update(m,l,layer,x,S,pos_base,m->kv);
+        else for(int s=0;s<S;s++)
+            v4_hca_update(m,l,layer,x+(int64_t)s*c->hidden,1,positions[s],kvs[s]);
     }
     float *ao=falloc((int64_t)S*H*hd);
     int win = layer<128 ? c->swa[layer] : 0;
@@ -2943,8 +3015,19 @@ static void attention_v4(Model *m, Layer *l, int layer, float *x, int S, int pos
             float acc=0; for(int j=0;j<hd;j++) acc+=q[j]*kt[j];
             acc*=c->attn_scale; sc[t-st0]=acc; if(acc>mx) mx=acc;
         }
+        /* HCA: le righe compresse visibili alla query t sono w < (t+1)/rate
+         * (block_bias del riferimento); partecipano alla STESSA softmax. */
+        int ncc = is_hca ? (pos+1)/c->hca_rate : 0;
+        if(ncc>ks->cc_len[layer]) ncc=ks->cc_len[layer];
+        float *cs = ncc>0 ? malloc((size_t)ncc*sizeof(float)) : NULL;
+        for(int w2=0;w2<ncc;w2++){
+            const float *ct=ks->Cc[layer]+(int64_t)w2*hd;
+            float acc=0; for(int j=0;j<hd;j++) acc+=q[j]*ct[j];
+            acc*=c->attn_scale; cs[w2]=acc; if(acc>mx) mx=acc;
+        }
         float sum=expf(l->sinks[h]-mx);
         for(int t=0;t<Tn-st0;t++){ sc[t]=expf(sc[t]-mx); sum+=sc[t]; }
+        for(int w2=0;w2<ncc;w2++){ cs[w2]=expf(cs[w2]-mx); sum+=cs[w2]; }
         float inv=1.f/(sum+1e-20f);
         float *dst=ao+(int64_t)s*H*hd+(int64_t)h*hd;
         for(int j=0;j<hd;j++) dst[j]=0;
@@ -2953,8 +3036,13 @@ static void attention_v4(Model *m, Layer *l, int layer, float *x, int S, int pos
             float w=sc[t-st0]*inv;
             for(int j=0;j<hd;j++) dst[j]+=w*vt[j];
         }
-        rope_v4(dst,pos,hd,rd,c->theta,-1.f);            /* rope inverso sull'output */
-        free(sc);
+        for(int w2=0;w2<ncc;w2++){
+            const float *vt=ks->Cc[layer]+(int64_t)w2*hd;                /* comp K==V */
+            float w=cs[w2]*inv;
+            for(int j=0;j<hd;j++) dst[j]+=w*vt[j];
+        }
+        rope_v4(dst,pos,hd,rd,th,-1.f);                  /* rope inverso sull'output */
+        free(sc); free(cs);
     }
     /* grouped O: oa[j] = o_a_w[j,:] . grouped[j/olr];  out = o_b @ oa */
     int g=c->o_groups, olr=c->o_lora, ing=H*hd/g;
@@ -5043,6 +5131,23 @@ static void kv_alloc(Model *m, int max_t){
     if(m->has_dsa){
         k->Ic=calloc(c->n_layers,sizeof(float*));
         for(int i=0;i<c->n_layers;i++) if(c->idx_type[i]) k->Ic[i]=falloc((int64_t)max_t*c->index_hd);
+    }
+    /* DSv4 HCA (stadio c): piano KV compresso per layer HCA — Cc righe emesse
+     * [max_t/rate, head_dim], piu' il ring kv/gate della finestra corrente
+     * [rate, head_dim] per il decode incrementale. */
+    if(k->Cc){ for(int i=0;i<c->n_layers;i++){ free(k->Cc[i]); free(k->ccK[i]); free(k->ccG[i]); }
+               free(k->Cc); free(k->ccK); free(k->ccG); free(k->cc_len);
+               k->Cc=NULL; k->ccK=NULL; k->ccG=NULL; k->cc_len=NULL; }
+    if(c->v4 && c->hca_rate>0){
+        k->Cc=calloc(c->n_layers,sizeof(float*));
+        k->ccK=calloc(c->n_layers,sizeof(float*)); k->ccG=calloc(c->n_layers,sizeof(float*));
+        k->cc_len=calloc(c->n_layers,sizeof(int));
+        int64_t crows=(int64_t)max_t/c->hca_rate+2;
+        for(int i=0;i<c->n_layers;i++) if(i<128 && c->hca[i]){
+            k->Cc[i]=falloc(crows*c->head_dim);
+            k->ccK[i]=falloc((int64_t)c->hca_rate*c->head_dim);
+            k->ccG[i]=falloc((int64_t)c->hca_rate*c->head_dim);
+        }
     }
     k->max_t=max_t;
     int NR=c->n_layers+1;                        /* riga extra: KV del layer MTP */
