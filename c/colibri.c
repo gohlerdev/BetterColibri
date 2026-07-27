@@ -5123,7 +5123,7 @@ static void run_replay(Model *m, const int *full, int nfull, int np){
 static void run_text(Model *m, const char *snap, const char *prompt, int ngen){
     Cfg *c=&m->c; char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
-    int eos=tok_id_of(&T,"<|endoftext|>");
+    int eos=tok_eos_lookup(&T);   /* family-aware: <|endoftext|> (GLM) or <|im_end|>/[EOS] (K2) */
     stops_arm_tok(&m->c, eos, &T);
     grammar_setup(&g_grd,&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
     if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della
@@ -5610,7 +5610,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
 
 static void run_serve_mux(Model *m, const char *snap){
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
-    Tok T; tok_load(&T,tkp); int eos=tok_id_of(&T,"<|endoftext|>"); stops_arm_tok(&m->c,eos,&T);
+    Tok T; tok_load(&T,tkp); int eos=tok_eos_lookup(&T);   /* family-aware: <|endoftext|> (GLM) or <|im_end|>/[EOS] (K2) */ stops_arm_tok(&m->c,eos,&T);
     g_draft=0; /* one scheduler owns every forward; MTP/n-gram speculation is not ragged-safe.
                 * Grammar-forced drafts ARE mux-safe (below): a drafting slot leaves the shared
                 * batch for one forward and runs the proven single-sequence verify path
@@ -5751,7 +5751,7 @@ static void run_serve(Model *m, const char *snap){
 #endif
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
-    int eos=tok_id_of(&T,"<|endoftext|>");
+    int eos=tok_eos_lookup(&T);   /* family-aware: <|endoftext|> (GLM) or <|im_end|>/[EOS] (K2) */
     stops_arm_tok(&m->c, eos, &T);
     grammar_setup(&g_grd,&T);                   /* metodo F: GRAMMAR=file.gbnf (#48) */
     if(g_temp<0) g_temp=0.7f;            /* auto: 0.7, NON l'1.0 ufficiale — la coda della

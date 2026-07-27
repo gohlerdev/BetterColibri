@@ -128,6 +128,57 @@ int main(void){
       fail|=expect("T=NULL: no tokenizer sweep",101,0);
       if(!fail) printf("  T=NULL -> config stops only (validation path untouched)   ok\n"); }
 
+    /* 6. SERVE mode, GLM markers: only <|endoftext|> survives the #401 filter. */
+    { Cfg c; memset(&c,0,sizeof c);
+      write_cfg(dir,"config.json","[100,101,102]");
+      rm_file(dir,"generation_config.json");
+      load_cfg(&c,dir);
+#ifdef _WIN32
+      _putenv_s("SERVE","1");
+#else
+      setenv("SERVE","1",1);
+#endif
+      stops_arm_tok(&c,100,&T);
+      fail|=expect("SERVE: endoftext stays",      100,1);
+      fail|=expect("SERVE: <|user|> filtered",    101,0);
+      fail|=expect("SERVE: <|observation|> filtered",102,0);
+      fail|=expect("SERVE: <sop> filtered",       104,0);
+      if(!fail) printf("  SERVE (glm) -> only <|endoftext|> stops (#401)   ok\n"); }
+
+    /* 7. SERVE mode, K2 markers: <|im_end|>/[EOS]/[EOT] are end-of-turn and must
+     *    ALL stop (K2's chat eos <|im_end|> differs from its config eos [EOS]);
+     *    role and tool-call markers must be filtered like GLM's. */
+    { static const char *K2JSON =
+        "{\"model\":{\"vocab\":{\"a\":0,\"b\":1,\"c\":2},\"merges\":[[\"a\",\"b\"]]},"
+        " \"added_tokens\":["
+        "   {\"id\":120,\"content\":\"[EOS]\",\"special\":true},"
+        "   {\"id\":121,\"content\":\"<|im_end|>\",\"special\":true},"
+        "   {\"id\":122,\"content\":\"[EOT]\",\"special\":true},"
+        "   {\"id\":123,\"content\":\"<|im_user|>\",\"special\":true},"
+        "   {\"id\":124,\"content\":\"<|im_assistant|>\",\"special\":true},"
+        "   {\"id\":125,\"content\":\"<|tool_call_begin|>\",\"special\":true},"
+        "   {\"id\":126,\"content\":\"<|tool_call_end|>\",\"special\":true}"
+        "]}";
+      char p2[512]; snprintf(p2,sizeof(p2),"%s/tokenizer.json",dir);
+      FILE *f=fopen(p2,"w"); if(!f){ perror(p2); return 1; }
+      fputs(K2JSON,f); fclose(f);
+      Tok TK; tok_load(&TK,p2);
+      int eos=tok_eos_lookup(&TK);
+      if(eos!=121){ fprintf(stderr,"  FAIL k2 eos lookup: got %d, expected 121 (<|im_end|>)\n",eos); fail=1; }
+      Cfg c; memset(&c,0,sizeof c);
+      write_cfg(dir,"config.json","[120]");     /* K2 config eos = [EOS] */
+      rm_file(dir,"generation_config.json");
+      load_cfg(&c,dir);
+      stops_arm_tok(&c,eos,&TK);
+      fail|=expect("SERVE k2: <|im_end|> stops",   121,1);
+      fail|=expect("SERVE k2: [EOS] stops",        120,1);
+      fail|=expect("SERVE k2: [EOT] stops",        122,1);
+      fail|=expect("SERVE k2: <|im_user|> filtered",123,0);
+      fail|=expect("SERVE k2: <|im_assistant|> filtered",124,0);
+      fail|=expect("SERVE k2: <|tool_call_begin|> filtered",125,0);
+      fail|=expect("SERVE k2: <|tool_call_end|> filtered",  126,0);
+      if(!fail) printf("  SERVE (k2) -> im_end/[EOS]/[EOT] stop, role+tool markers filtered   ok\n"); }
+
     rm_file(dir,"config.json"); rm_file(dir,"generation_config.json"); rm_file(dir,"tokenizer.json");
     rmdir(dir);
     if(fail){ printf("test_stops: FAIL\n"); return 1; }

@@ -108,6 +108,27 @@ static inline int is_stop(int t){
     for (int i = 0; i < g_nstop; i++) if (t == g_stop[i]) return 1;
     return 0;
 }
+/* End-of-turn marker spellings across supported model families. GLM-5.2 ends
+ * turns with <|endoftext|>; Kimi-K2 has NO <|endoftext|> -- its config eos is
+ * [EOS] and its generation_config (chat authority) says <|im_end|>, with [EOT]
+ * also reserved. Everything else that is "special" (role markers, K2's
+ * <|tool_call_begin|>...) is a boundary or content the server owns, never a
+ * hard stop in serve mode (#401). */
+static const char *EOS_MARKERS[] = {"<|endoftext|>", "<|im_end|>", "[EOS]", "[EOT]"};
+static int eos_marker(const char *s){
+    if (!s) return 0;
+    for (size_t i = 0; i < sizeof(EOS_MARKERS)/sizeof(EOS_MARKERS[0]); i++)
+        if (!strcmp(s, EOS_MARKERS[i])) return 1;
+    return 0;
+}
+/* Primary EOS id for a tokenizer, whatever the family calls it. */
+static int tok_eos_lookup(Tok *T){
+    for (size_t i = 0; i < sizeof(EOS_MARKERS)/sizeof(EOS_MARKERS[0]); i++){
+        int id = tok_id_of(T, EOS_MARKERS[i]);
+        if (id >= 0) return id;
+    }
+    return -1;
+}
 /* T=NULL -> config stops only (validation/oracle, where the tokenizer is not needed). */
 static void stops_arm_tok(const Cfg *c, int tok_eos, Tok *T){
     g_nstop = 0;
@@ -116,13 +137,23 @@ static void stops_arm_tok(const Cfg *c, int tok_eos, Tok *T){
     int nsp = 0;
     if (T) for (int id = 0; id < T->n_ids && g_nstop < 64; id++)
         if (T->id_special[id] && !is_stop(id)) { g_stop[g_nstop++] = id; nsp++; }
-    /* #401: in serve mode keep ONLY <|endoftext|>. Role markers <|user|>/<|observation|>
-     * (config stops + tokenizer special set) are boundaries the Python server owns; as
-     * hard stops they cut generation the moment the model opens a <tool_call> block,
-     * because int4 argmax noise picks a stop-token ID over the correct '<' token. */
+    /* #401: in serve mode keep ONLY end-of-turn markers. Role markers
+     * <|user|>/<|observation|> (config stops + tokenizer special set) are
+     * boundaries the Python server owns; as hard stops they cut generation the
+     * moment the model opens a <tool_call> block, because int4 argmax noise
+     * picks a stop-token ID over the correct '<' token. Matching by MARKER SET
+     * (not just the primary eos id) keeps K2 correct too: its chat turns end
+     * with <|im_end|> while config eos is [EOS] -- both must stop -- and its
+     * tool-call markers are special:true and must NOT. For GLM the only marker
+     * present is <|endoftext|>, so behavior is unchanged. */
     if (getenv("SERVE") && tok_eos >= 0) {
         int kept = 0;
-        for (int i = 0; i < g_nstop; i++) if (g_stop[i] == tok_eos) g_stop[kept++] = g_stop[i];
+        for (int i = 0; i < g_nstop; i++){
+            int keep = (g_stop[i] == tok_eos);
+            if (!keep && T && g_stop[i] >= 0 && g_stop[i] < T->n_ids)
+                keep = T->id_added[g_stop[i]] && eos_marker(T->id2str[g_stop[i]]);
+            if (keep) g_stop[kept++] = g_stop[i];
+        }
         if (kept < g_nstop) fprintf(stderr, "[stop] serve mode: filtered %d non-EOS stop tokens (tool-call safety, #401)\n", g_nstop - kept);
         g_nstop = kept; nsp = 0;
     }
