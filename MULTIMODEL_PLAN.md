@@ -150,3 +150,24 @@ V4-Flash design-doc milestone.
 converter coverage (K2 fp8→int4, V4 fp4 passthrough into fmt=7 slabs +
 tid2eid shipping), K2 tiktoken tokenizer, teacher-forcing oracle validation
 per model — the GLM discipline applied to each.
+
+## Status update (2026-07-27, overnight session)
+
+The oracle-validation debt above is now paid for every family this host can
+hold, and the two "medium" build-sequence items landed:
+
+| Item | Commit | Evidence |
+|------|--------|----------|
+| K2 tokenizer: tiktoken→tokenizer.json converter + K2 pre-tokenizer family in tok.h (`[\p{Han}]+` arm, `&&[^\p{Han}]`, tiktoken-probed Han table) | 4270b57 | 90/90 adversarial + 700/700 fuzz vs real tiktoken on the real 163k model, byte-exact round-trips; CI test_tok_k2 49/49 |
+| K2 gateway chat family (`COLI_CHAT_FAMILY=k2`): official-jinja byte-parity render + tool-call parse | 8b72ed2 | 12 tests incl. byte equality vs jinja2-rendered official template on 7 conversations |
+| Family-aware EOS + serve-stop filter (K2 has no `<|endoftext|>`; served K2 would have armed ZERO stops) | 9af18c0 | test_stops SERVE glm/k2 cases; GLM bit-identical |
+| **DeepSeek-V3 end-to-end oracle** (n_group=4/topk_group=2 through the real binary) | 37689c0 | **TF 32/32 f32, greedy 20/20**, group routing exercised in a real forward |
+| **K2 stack integration smoke** (DSv3 arch + K2 tokenizer + K2 stops through the real mux protocol) | 0b596c7 | READY→SUBMIT→DATA→DONE, `[stop] 2 stop tokens: [EOS] <|im_end|>` |
+| **Qwen3-MoE GQA family** — the step-4 unlock: attention_gqa (per-head q/k norm pre-RoPE, split-half RoPE, kv_head=h/(H/KVH)), MLA Lc/Rc cache reused for K/V rows, softmax router, no shared/dense | 7785b44 | numpy L0 pinning 2e-7 → **TF 32/32 f32 at FIRST RUN**, greedy 20/20, int8 32/32, 2-slot ragged mux serve smoke |
+
+**Four families now oracle-validated end-to-end through the engine binary:
+GLM-5.2 (32/32), DeepSeek-V3 (32/32), Qwen3-MoE (32/32), plus the K2 serve
+stack proven integrated.** GPT-OSS is now a small delta on the GQA path
+(attention sinks + sliding window). What remains disk-bound: real-weight
+converter runs (K2 fp8→int4 ~515 GB, DSv3, Qwen3-235B) and per-model
+real-weight oracle validation — the engine side of all four is done.
