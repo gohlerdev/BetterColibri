@@ -233,6 +233,26 @@ _PARTIAL_END_RE = re.compile(r"<(?:/(?:t(?:o(?:o(?:l(?:_(?:c(?:a(?:l)?)?)?)?)?)?
 # <arg_key>K</arg_key><arg_value> structure. Default OFF (never rewrites well-formed output).
 _SALVAGE = os.environ.get("COLI_TOOL_SALVAGE", "0") == "1"
 
+# ---- Chat-template family (#multimodel) ----------------------------------------------------
+# COLI_CHAT_FAMILY selects which model's chat markup the gateway renders and parses.
+#   glm (default) -- GLM-5.2: [gMASK]<sop>, <|user|>/<|assistant|>, <think>, <tool_call> boxes.
+#   k2            -- Kimi K2: <|im_user|>name<|im_middle|>...<|im_end|> turns and
+#                    <|tool_calls_section_begin|> call blocks (chat_template.jinja, byte-matched
+#                    by tests/test_k2_template.py against the official template).
+CHAT_FAMILY = os.environ.get("COLI_CHAT_FAMILY", "glm").strip().lower()
+if CHAT_FAMILY not in ("glm", "k2"):
+    raise SystemExit(f"COLI_CHAT_FAMILY must be 'glm' or 'k2', not {CHAT_FAMILY!r}")
+
+# K2 tool-call markup (chat_template.jinja): calls ride between section markers, each one
+#   <|tool_call_begin|>{id}<|tool_call_argument_begin|>{json args}<|tool_call_end|>
+# where id is "functions.{name}:{index}" (tokenization_kimi/vLLM convention).
+K2_SEC_START, K2_SEC_END = "<|tool_calls_section_begin|>", "<|tool_calls_section_end|>"
+K2_CALL_RE = re.compile(
+    re.escape("<|tool_call_begin|>") + r"(.*?)" +
+    re.escape("<|tool_call_argument_begin|>") + r"(.*?)" +
+    re.escape("<|tool_call_end|>"), re.DOTALL)
+K2_DEFAULT_SYSTEM = "You are Kimi, an AI assistant created by Moonshot AI."
+
 
 def _tool_param_order(tools):
     """name -> ordered param names (required first) from the request schema, for de-mangling."""
@@ -309,7 +329,7 @@ def _unclosed_tail(reply, tools):
     return inner if inner.strip() in declared else None
 
 
-def parse_tool_calls(reply, tools=None):
+def parse_tool_calls_glm(reply, tools=None):
     """Return (content, tool_calls). Strict GLM parse; optional de-mangler (COLI_TOOL_SALVAGE=1)
     rescues malformed int4 output by mapping a lone payload onto the tool's primary parameter."""
     param_order = _tool_param_order(tools)
@@ -371,8 +391,8 @@ def parse_tool_calls(reply, tools=None):
     return text.strip(), calls
 
 
-def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=None,
-                tool_choice=None):
+def render_chat_glm(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                    tool_choice=None):
     """Render the text-only subset of the official GLM-5.2 chat template."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
@@ -447,6 +467,127 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
     prompt.append("<|assistant|><think>" if enable_thinking else
                   "<|assistant|><think></think>")
     return "".join(prompt)
+
+
+def render_chat_k2(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                   tool_choice=None):
+    """Render the official Kimi-K2 chat template (chat_template.jinja), byte-for-byte.
+
+    Faithful to the jinja INCLUDING its quirk: when the first message is not a system
+    turn, the injected default system block ends with "<|im_end|>\\n  " (the template's
+    `{% endif %}` line keeps its trailing newline + indent). Byte parity is the point --
+    the model was trained on that exact rendering, and tests/test_k2_template.py pins
+    every case against the official template rendered by jinja2 itself.
+
+    K2 has no <think> protocol in the template; enable_thinking/reasoning_effort are
+    accepted (same signature as GLM) and ignored. tool_choice forcing is expressed as a
+    trailing system instruction since the template has no native slot for it."""
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    forced = None
+    if isinstance(tool_choice, dict):
+        forced = ((tool_choice.get("function") or {}).get("name")
+                  or tool_choice.get("name"))
+        if forced:
+            tools = [t for t in (tools or [])
+                     if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
+    elif tool_choice == "none":
+        tools = None
+    prompt = []
+    if tools:
+        prompt.append("<|im_system|>tool_declare<|im_middle|>"
+                      + json.dumps(tools, separators=(",", ":"), ensure_ascii=False)
+                      + "<|im_end|>")
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if index == 0 and role != "system":
+            prompt.append(f"<|im_system|>system<|im_middle|>{K2_DEFAULT_SYSTEM}<|im_end|>\n  ")
+        name = message.get("name") or role
+        param = f"messages.{index}.content"
+        if role in ("system", "developer"):
+            # jinja: role_name = name or role -- a "developer" turn renders as
+            # <|im_system|>developer<|im_middle|>, exactly like the official template.
+            prompt.append(f"<|im_system|>{name}<|im_middle|>"
+                          + content_text(message.get("content"), param) + "<|im_end|>")
+        elif role == "user":
+            prompt.append(f"<|im_user|>{name}<|im_middle|>"
+                          + content_text(message.get("content"), param) + "<|im_end|>")
+        elif role == "assistant":
+            raw = message.get("content")
+            text = content_text(raw, param) if raw is not None else ""
+            piece = f"<|im_assistant|>{name}<|im_middle|>{text}"
+            calls = message.get("tool_calls") or []
+            if calls:
+                piece += K2_SEC_START
+                for ci, tc in enumerate(calls):
+                    fn = tc.get("function", tc) if isinstance(tc, dict) else {}
+                    args = fn.get("arguments", "{}")
+                    if not isinstance(args, str):
+                        args = json.dumps(args, ensure_ascii=False)
+                    call_id = (tc.get("id") if isinstance(tc, dict) else None) \
+                        or f"functions.{fn.get('name') or ''}:{ci}"
+                    piece += ("<|tool_call_begin|>" + call_id
+                              + "<|tool_call_argument_begin|>" + args + "<|tool_call_end|>")
+                piece += K2_SEC_END
+            prompt.append(piece + "<|im_end|>")
+        elif role == "tool":
+            call_id = message.get("tool_call_id") or ""
+            prompt.append(f"<|im_system|>tool<|im_middle|>## Return of {call_id}\n"
+                          + content_text(message.get("content"), param) + "<|im_end|>")
+        else:
+            raise APIError(400, f"Unsupported message role: {role!r}.",
+                           f"messages.{index}.role", "unsupported_role")
+    if forced:
+        prompt.append("<|im_system|>system<|im_middle|>You must call the function "
+                      f"`{forced}`. Do not answer directly.<|im_end|>")
+    elif tool_choice == "required":
+        prompt.append("<|im_system|>system<|im_middle|>You must call one of the declared "
+                      "functions. Do not answer directly.<|im_end|>")
+    prompt.append("<|im_assistant|>assistant<|im_middle|>")
+    return "".join(prompt)
+
+
+def parse_tool_calls_k2(reply, tools=None):
+    """Return (content, tool_calls) from K2 output. K2 emits complete
+    <|tool_call_begin|>id<|tool_call_argument_begin|>{json}<|tool_call_end|> blocks;
+    the call NAME lives inside the id ("functions.{name}:{idx}"). Arguments are
+    plain JSON, so no per-key coercion is needed (that is GLM's arg_key/arg_value
+    problem). Section markers and call blocks are stripped from the content."""
+    calls = []
+    for m in K2_CALL_RE.finditer(reply):
+        call_id, args = m.group(1).strip(), m.group(2).strip()
+        name = call_id
+        if name.startswith("functions."):
+            name = name[len("functions."):]
+        name = name.rsplit(":", 1)[0] if ":" in name else name
+        try:
+            parsed = json.loads(args) if args else {}
+            if not isinstance(parsed, dict):
+                parsed = {"value": parsed}
+        except (json.JSONDecodeError, ValueError):
+            parsed = {"raw": args}
+        calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                      "function": {"name": name,
+                                   "arguments": json.dumps(parsed, ensure_ascii=False)}})
+    text = K2_CALL_RE.sub("", reply)
+    for marker in (K2_SEC_START, K2_SEC_END):
+        text = text.replace(marker, "")
+    if calls:
+        sys.stderr.write("[api] tool-calls: %d total (k2 family)\n" % len(calls))
+        sys.stderr.flush()
+    return text.strip(), calls
+
+
+# Family dispatch: every call site uses these names; the family is fixed per process
+# (it describes the MODEL being served, not the request).
+if CHAT_FAMILY == "k2":
+    render_chat, parse_tool_calls = render_chat_k2, parse_tool_calls_k2
+    TOOL_MARKER = K2_SEC_START          # streaming holdback sentinel (#see emit_tools)
+else:
+    render_chat, parse_tool_calls = render_chat_glm, parse_tool_calls_glm
+    TOOL_MARKER = BOX_START
 
 
 # ---- Anthropic Messages API (#343) --------------------------------------------------------
@@ -1382,7 +1523,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     # calls from the FULL reply after generation. Hold back a marker-length tail so a
                     # <tool_call> split across engine chunks is still caught.
                     sp = {"buf": "", "tool": False}
-                    hold = len(BOX_START) - 1
+                    hold = len(TOOL_MARKER) - 1
                     raw = []
                     def emit_tools(chunk):
                         raw.append(chunk)
@@ -1391,7 +1532,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         if sp["tool"]:
                             return
                         sp["buf"] += chunk
-                        cut = sp["buf"].find(BOX_START)
+                        cut = sp["buf"].find(TOOL_MARKER)
                         if cut >= 0:
                             if cut:
                                 emit(sp["buf"][:cut])
@@ -1624,7 +1765,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
             raw = []
             state = {"buf": "", "in_tool": False}
-            hold = len(BOX_START) - 1
+            hold = len(TOOL_MARKER) - 1
 
             def on_text(chunk):
                 raw.append(chunk)
@@ -1635,7 +1776,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 if state["in_tool"]:
                     return                       # tool markers never reach the client as text
                 state["buf"] += chunk
-                cut = state["buf"].find(BOX_START)
+                cut = state["buf"].find(TOOL_MARKER)
                 if cut >= 0:
                     if cut:
                         send_event("content_block_delta", {"type": "content_block_delta", "index": 0,

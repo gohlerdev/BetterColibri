@@ -1,0 +1,169 @@
+{
+ "basic_user": {
+  "case": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ]
+  },
+  "expected": "<|im_system|>system<|im_middle|>You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>\n  <|im_user|>user<|im_middle|>Hi<|im_end|><|im_assistant|>assistant<|im_middle|>"
+ },
+ "system_first": {
+  "case": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Sys"
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    },
+    {
+     "role": "assistant",
+     "content": "Yo"
+    },
+    {
+     "role": "user",
+     "content": "Again"
+    }
+   ]
+  },
+  "expected": "<|im_system|>system<|im_middle|>Sys<|im_end|><|im_user|>user<|im_middle|>Hi<|im_end|><|im_assistant|>assistant<|im_middle|>Yo<|im_end|><|im_user|>user<|im_middle|>Again<|im_end|><|im_assistant|>assistant<|im_middle|>"
+ },
+ "named_user": {
+  "case": {
+   "messages": [
+    {
+     "role": "user",
+     "name": "alice",
+     "content": "hey"
+    }
+   ]
+  },
+  "expected": "<|im_system|>system<|im_middle|>You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>\n  <|im_user|>alice<|im_middle|>hey<|im_end|><|im_assistant|>assistant<|im_middle|>"
+ },
+ "tool_round_trip": {
+  "case": {
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "weather?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "functions.get_weather:0",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\":\"Rome\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "functions.get_weather:0",
+     "content": "sunny"
+    }
+   ]
+  },
+  "expected": "<|im_system|>tool_declare<|im_middle|>[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}}}}]<|im_end|><|im_system|>system<|im_middle|>You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>\n  <|im_user|>user<|im_middle|>weather?<|im_end|><|im_assistant|>assistant<|im_middle|><|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\":\"Rome\"}<|tool_call_end|><|tool_calls_section_end|><|im_end|><|im_system|>tool<|im_middle|>## Return of functions.get_weather:0\nsunny<|im_end|><|im_assistant|>assistant<|im_middle|>"
+ },
+ "multi_tool_calls": {
+  "case": {
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "compare"
+    },
+    {
+     "role": "assistant",
+     "content": "checking",
+     "tool_calls": [
+      {
+       "id": "functions.get_weather:0",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\":\"Rome\"}"
+       }
+      },
+      {
+       "id": "functions.get_weather:1",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\":\"Oslo\"}"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "expected": "<|im_system|>tool_declare<|im_middle|>[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}}}}]<|im_end|><|im_system|>system<|im_middle|>You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>\n  <|im_user|>user<|im_middle|>compare<|im_end|><|im_assistant|>assistant<|im_middle|>checking<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\":\"Rome\"}<|tool_call_end|><|tool_call_begin|>functions.get_weather:1<|tool_call_argument_begin|>{\"city\":\"Oslo\"}<|tool_call_end|><|tool_calls_section_end|><|im_end|><|im_assistant|>assistant<|im_middle|>"
+ },
+ "unicode_content": {
+  "case": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "你好 world 🙂"
+    }
+   ]
+  },
+  "expected": "<|im_system|>system<|im_middle|>You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>\n  <|im_user|>user<|im_middle|>你好 world 🙂<|im_end|><|im_assistant|>assistant<|im_middle|>"
+ },
+ "developer_role": {
+  "case": {
+   "messages": [
+    {
+     "role": "developer",
+     "content": "Rules"
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ]
+  },
+  "expected": "<|im_system|>system<|im_middle|>You are Kimi, an AI assistant created by Moonshot AI.<|im_end|>\n  <|im_system|>developer<|im_middle|>Rules<|im_end|><|im_user|>user<|im_middle|>Hi<|im_end|><|im_assistant|>assistant<|im_middle|>"
+ }
+}
