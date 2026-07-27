@@ -127,6 +127,8 @@ static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
         return (int64_t)t->O*ng*24 + (int64_t)t->O*ng*4; }
     if(t->fmt==6)  /* E8/IQ3: 98B per 256 weights, scales in-block, .qs is a 4-byte tag */
         return (int64_t)t->O*(((int64_t)t->I+255)/256)*98 + 4;
+    if(t->fmt==7)  /* FP4 e2m1: int4 nibbles + O per-row scales + 1 magic float */
+        return (int64_t)t->O*((t->I+1)/2) + ((int64_t)t->O+1)*4;
     return (int64_t)t->O*((t->I+1)/2) + (int64_t)t->O*4;  /* fmt=2 int4 per-row */
 }
 
@@ -293,7 +295,7 @@ static void qt_cuda_reset(QT *t){
     t->cuda_failed=0;
 }
 static int qt_cuda_upload(QT *t){
-    if(t->fmt==5||t->fmt==6) return 0;   /* int3-g64 / E8: no CUDA kernel yet — tensor stays CPU-side */
+    if(t->fmt==5||t->fmt==6||t->fmt==7) return 0;   /* int3-g64 / E8 / FP4: no CUDA kernel yet — tensor stays CPU-side */
     const void *weights = t->fmt==0 ? (const void*)t->qf
                         : t->fmt==1 ? (const void*)t->q8 : (const void*)t->q4;
     if(t->fmt==4)   /* grouped int4 (#334): scales are [O, ceil(I/gs)] — the plain
@@ -536,7 +538,7 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     }
 #endif
 #ifdef COLI_CUDA
-    if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && w->fmt!=5 && w->fmt!=6 && !omp_in_parallel()){
+    if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && w->fmt!=5 && w->fmt!=6 && w->fmt!=7 && !omp_in_parallel()){
         const void *weights = w->fmt==0 ? (const void*)w->qf
                             : w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device,w->gs)) return;
@@ -548,6 +550,7 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
     if(w->fmt==4){ matmul_i4_grouped(y,x,w->q4,w->s,S,w->I,w->O,w->gs); return; }
     if(w->fmt==6){ matmul_e8(y,x,w->q4,NULL,S,w->I,w->O); return; }   /* scales live in-block */
+    if(w->fmt==7){ matmul_fp4(y,x,w->q4,w->s,S,w->I,w->O); return; }  /* FP4 e2m1 (DSv4) */
     if(allow_idot && g_idot && (w->fmt==1 || (w->fmt==2 && (spec_pinned() ? g_i4s<=1 : S>=g_i4s)))){
         int I=w->I; int8_t *xq; float *sx;
         if(S<0 || I<0 || (size_t)S>SIZE_MAX/(size_t)(I?I:1)){ fprintf(stderr,"matmul_qt: shape overflow\n"); exit(1); }
@@ -1089,6 +1092,13 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
      * convention is kept with a single-float tag — ns==4 is the discriminator
      * (every other format carries at least O floats of real scales). */
     if(ns==4 && nb==(int64_t)O*e8_rowbytes(I)){ *gs=0; return 6; }
+    /* fmt=7 (FP4 e2m1, DeepSeek-V4 experts): same nibble byte count as int4,
+     * discriminated by a scale array of O+1 floats — the TRAILING float is the
+     * "FP4\0" magic (0x00345046 raw bits), validated where the scales are READ
+     * (qt_from_disk / expert_load paths; this function only sees byte counts).
+     * No legitimate per-row format carries O+1 scales, so the count alone is
+     * unambiguous among known layouts. */
+    if(nb==exp_i4 && ns==(int64_t)(O+1)*4){ *gs=0; return 7; }
     /* Row formats take precedence: for tiny I the int3-g64 byte count can coincide with
      * a row layout (e.g. [O,48]: ceil(48/2)=24=1*24). For real tensor shapes the counts
      * are distinct, and the weight bytes — not the scale size — are the int3 tag, because
@@ -1100,7 +1110,8 @@ static int qt_resolve_fmt(const char *name, int O, int I, int64_t nb, int64_t ns
     *gs=0;
     if(fmt==2){ int g=detect_group_size(O,I,ns); if(g>0){ fmt=4; *gs=g; } }
     int64_t exp_scale = (fmt==4)? (int64_t)O*((I+*gs-1)/(*gs))
-                      : (fmt==5)? (int64_t)O*i3_groups(I) : (int64_t)O;   /* in FLOAT */
+                      : (fmt==5)? (int64_t)O*i3_groups(I)
+                      : (fmt==7)? (int64_t)O+1 : (int64_t)O;   /* in FLOAT */
     if(ns != exp_scale*4){
         fprintf(stderr,"%s: scale array is %lld bytes — expected %lld for [%d,%d] fmt=%d, refusing (untrusted container)\n",
                 name,(long long)ns,(long long)(exp_scale*4),O,I,fmt); exit(1); }
@@ -1130,6 +1141,9 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
         else if(fmt==6){   /* E8/IQ3: everything in-block, .qs is the 4-byte tag */
             if(t->fmt!=6||!t->q4){ t->fmt=6; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=qsalloc(1); }
             st_read_raw(&m->S,name,t->q4,drop); }
+        else if(fmt==7){   /* FP4 e2m1: int4 nibbles + O scales + 1 trailing magic float */
+            if(t->fmt!=7||!t->q4){ t->fmt=7; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=falloc((int64_t)O+1); }
+            st_read_raw(&m->S,name,t->q4,drop); }
         else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->gs=0; t->q4=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q4,drop); }
         /* cap MUST match the scale cardinality qt_resolve_fmt already validated and
          * the falloc above actually reserved, per format: grouped-int4 (fmt=4) keeps
@@ -1139,7 +1153,14 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
         st_read_f32_cap(&m->S,sn,t->s,
                         fmt==4 ? (int64_t)O*((I+gs-1)/gs) :
                         fmt==5 ? (int64_t)O*i3_groups(I)  :
-                        fmt==6 ? (int64_t)1               : (int64_t)O, drop);
+                        fmt==6 ? (int64_t)1               :
+                        fmt==7 ? (int64_t)O+1             : (int64_t)O, drop);
+        /* fmt=7 magic check where the scales are actually read: the trailing
+         * float must be the "FP4\0" tag or the container is refused (SEC). */
+        if(fmt==7){ uint32_t tag; memcpy(&tag,&t->s[O],4);
+            if(tag!=0x00345046u){
+                fprintf(stderr,"%s: fp4 scale magic mismatch (got 0x%08x), refusing (untrusted container)\n",name,tag);
+                exit(1); } }
     } else {
         if(!t->qf && !t->q8 && !t->q4) qt_alloc(t,O,I,bits);
         if(t->fmt==0) st_read_f32_cap(&m->S,name,t->qf,(int64_t)O*I,drop);
@@ -1156,9 +1177,10 @@ static QT qt_load(Model *m, const char *name, int O, int I, int bits){
      * the 1-float .qs tag out of bounds. A container that packs a RESIDENT tensor
      * (embed/lm_head/attention/shared-expert/router) as fmt=6 is refused loudly here
      * — same policy as qt_resolve_fmt for unknown layouts (untrusted container). */
-    if(t.fmt==6){
-        fprintf(stderr,"%s: E8/IQ3 (fmt=6) is supported for streamed experts only — "
-                "a resident tensor in this format cannot be computed faithfully, refusing\n",name);
+    if(t.fmt==6 || t.fmt==7){
+        fprintf(stderr,"%s: fmt=%d (%s) is supported for streamed experts only — "
+                "a resident tensor in this format cannot be computed faithfully, refusing\n",
+                name,t.fmt,t.fmt==6?"E8/IQ3":"FP4");
         exit(1);
     }
 #ifdef COLI_CUDA
@@ -5940,6 +5962,7 @@ static int64_t qt_scale_bytes(const QT *t){
     if(t->fmt==4){ int ng=(t->I+t->gs-1)/t->gs; return (int64_t)t->O*ng*4; }
     if(t->fmt==5) return (int64_t)t->O*i3_groups(t->I)*4;
     if(t->fmt==6) return 4;
+    if(t->fmt==7) return ((int64_t)t->O+1)*4;    /* FP4: O scales + magic float */
     if(t->fmt==0) return 0;                      /* f32: no scale array */
     return (int64_t)t->O*4;                      /* fmt 1/2/3: per-row */
 }

@@ -122,6 +122,36 @@ int main(void){
     /* cleanup */
     { char p[512]; snprintf(p,sizeof(p),"%s/config.json",dir); remove(p); rmdir(dir); }
 
+    /* ---- fmt=7 (FP4) container tagging: qt_resolve_fmt must discriminate the
+     * O+1-scale FP4 layout from every neighboring format, and qt_bytes must
+     * account the extra magic float ---- */
+    { int O=24, I=512, gs=0;
+      int64_t nib=(int64_t)O*((I+1)/2);
+      /* FP4: int4-sized weights + (O+1) scales */
+      int f=qt_resolve_fmt("fp4-test",O,I,nib,((int64_t)O+1)*4,&gs);
+      if(f!=7||gs!=0) FAIL("fp4 resolve: fmt=%d gs=%d, want 7/0",f,gs);
+      /* plain int4: same weights, O scales — must stay fmt=2 */
+      f=qt_resolve_fmt("i4-test",O,I,nib,(int64_t)O*4,&gs);
+      if(f!=2) FAIL("i4 resolve: fmt=%d, want 2",f);
+      /* qt_bytes accounts O+1 scale floats for fmt=7 */
+      { QT t; memset(&t,0,sizeof(t)); t.fmt=7; t.O=O; t.I=I;
+        int64_t want=nib+((int64_t)O+1)*4;
+        if(qt_bytes(&t)!=want) FAIL("fp4 qt_bytes: %lld want %lld",
+                                    (long long)qt_bytes(&t),(long long)want); }
+      /* dispatch reality: matmul_qt on an fmt=7 QT runs matmul_fp4 (same result
+       * as calling the kernel directly) */
+      { QT t; memset(&t,0,sizeof(t)); t.fmt=7; t.O=8; t.I=32;
+        static uint8_t q[8*16]; static float s[9]; static float x[32], y1[8], y2[8];
+        for(unsigned i=0;i<sizeof(q);i++) q[i]=(uint8_t)(i*37+11);
+        for(int o=0;o<8;o++) s[o]=0.5f+0.1f*o;
+        memcpy(&s[8],"FP4",4);
+        for(int i=0;i<32;i++) x[i]=(float)(i%7)-3.f;
+        t.q4=q; t.s=s;
+        matmul_qt(y1,x,&t,1);
+        matmul_fp4(y2,x,q,s,1,32,8);
+        for(int o=0;o<8;o++) if(y1[o]!=y2[o]) FAIL("fp4 dispatch o=%d: %g vs %g",o,y1[o],y2[o]); }
+      g_fail+=0; }
+
     printf("test_model_cfg: 4 model shapes, %d failure(s)\n", g_fail);
     if(g_fail) return 1;
     puts("test_model_cfg: ok");
