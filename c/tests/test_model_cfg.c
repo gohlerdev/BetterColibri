@@ -32,7 +32,12 @@ static void write_cfg(const char *dir, const char *json){
 }
 
 int main(void){
-    char dir[]="/tmp/coli_cfg_XXXXXX";
+    /* Relative to the CWD, NOT "/tmp/...": these binaries are built by MinGW
+     * into native Windows .exe files, which resolve Windows paths. "/tmp" is
+     * not one, so mkdtemp fails ENOENT and the windows job (only) goes red.
+     * Same trap test_stops.c documents; the fork's Actions were disabled, so
+     * this shipped unnoticed in 24e75a8. */
+    char dir[]="coli_cfg_XXXXXX";
     if(!mkdtemp(dir)){ perror("mkdtemp"); return 1; }
 
     /* ---- Kimi K2 (moonshotai/Kimi-K2-Instruct, real dims) ---- */
